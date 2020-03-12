@@ -8,3 +8,6 @@ edition = "2018"
 
 [dependencies]
 tokio = { version = "^0.2.3", features = [ "full" ] }
+json = "0.12.2"
+httparse = "1.3.4"
+memchr = "2.3.3"
