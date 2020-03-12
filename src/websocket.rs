@@ -2,14 +2,12 @@ use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, Ipv4Addr, Shutdown};
 use tokio::net::{TcpListener, TcpStream};
 use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64};
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::io::{BufRead, Cursor};
 use memchr::memchr;
-use std::convert::From;
-use std::any::Any;
+use crypto::sha1::Sha1;
+use crypto::digest::Digest;
 
 #[derive(Default, Debug)]
 struct WebsocketData {
@@ -48,7 +46,7 @@ impl WebsocketServer {
 
         let mut l = TcpListener::bind(self.addr).await?;
         loop {
-            let (mut sock, addr) = l.accept().await?;
+            let (mut sock, _addr) = l.accept().await?;
             tokio::spawn(Self::handler(self.state.clone(), sock));
         }
     }
@@ -58,12 +56,44 @@ impl WebsocketServer {
         let data = match Self::receive_handshake_data(&mut socket).await {
             Ok(d) => d,
             Err(_) => {
-                socket.shutdown(Shutdown::Both);
+                socket.shutdown(Shutdown::Both).unwrap();
                 return;
             }
         };
 
-        data.headers.get("Connection");
+        if !data.headers.get("Connection").map_or(false, |v| v.to_lowercase() == "upgrade") {
+            return;
+        }
+        if !data.headers.get("Upgrade").map_or(false, |v| v.to_lowercase() == "websocket") {
+            return;
+        }
+
+        let resp_key = if let Some(key) = data.headers.get("Sec-WebSocket-Key") {
+            let mut decoded_key = base64::decode(key).unwrap();
+            decoded_key.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            let mut hasher = Sha1::new();
+            hasher.input(decoded_key.as_slice());
+            let mut output = [0u8; 20];
+            hasher.result(&mut output);
+            base64::encode(output)
+        } else {
+            return;
+        };
+
+        socket.write(format!("\
+        HTTP/1.1 101 Switching Protocols\r\n\
+        Upgrade: websocket\r\n\
+        Connection: Upgrade\r\n\
+        Sec-WebSocket-Accept: {}\r\n\
+        \r\n\r\n
+        ", resp_key).as_bytes()).await.unwrap();
+
+        println!("Connected!!!!!1");
+        let mut buff = [0u8; 1024];
+        loop {
+            socket.read(&mut buff).await.unwrap();
+        }
+
 
     }
 
@@ -92,7 +122,7 @@ impl WebsocketServer {
 
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(handshake.as_slice()) {
-            Ok(httparse::Status::Complete(len)) => {},
+            Ok(httparse::Status::Complete(_len)) => {},
             _ => {
                 return Err(());
             }
@@ -127,13 +157,13 @@ impl WebsocketServer {
         // header processing
         for h in headers.iter() {
             match String::from_utf8(h.value.to_vec()) {
-                Ok(v) => res.headers.insert(h.name.to_string(), v),
+                Ok(v) => res.headers.insert(h.name.to_lowercase(), v),
                 Err(_) => continue
             };
         }
 
 
-        socket.write(format!("HTTP/1.1 200\r\n\r\n<pre>{:#?}</pre>\r\n", res).as_bytes()).await;
+        // socket.write(format!("HTTP/1.1 200\r\n\r\n<pre>{:#?}</pre>\r\n", res).as_bytes()).await;
 
         Ok(WebsocketData::default())
     }
