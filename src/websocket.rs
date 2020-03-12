@@ -10,6 +10,10 @@ use crypto::sha1::Sha1;
 use crypto::digest::Digest;
 use httparse::Header;
 
+enum HandshakeError {
+    TooManyHeaders
+}
+
 #[derive(Default, Debug)]
 struct WebsocketData {
     path: String,
@@ -54,7 +58,11 @@ impl WebsocketServer {
 
 
     async fn handler(this: Arc<WebsocketServerState>, mut socket: TcpStream) {
-        let data = match Self::receive_handshake_data(&mut socket).await {
+
+    }
+
+    async fn handshake(&mut socket: TcpStream) -> Result<> {
+        let data = match Self::receive_handshake_data(socket).await {
             Ok(d) => d,
             Err(_) => {
                 socket.shutdown(Shutdown::Both).unwrap();
