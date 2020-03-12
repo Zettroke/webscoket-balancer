@@ -42,10 +42,14 @@ struct WebsocketServerState {
 
 pub struct WebsocketServer {
     addr: SocketAddr,
-
     state: Arc<WebsocketServerState>
 }
 
+impl Default for WebsocketServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl WebsocketServer {
 
@@ -77,19 +81,19 @@ impl WebsocketServer {
         let data = Self::receive_handshake_data(socket).await?;
 
         // Check connection header
-        let conn = data.headers.get("connection").ok_or(HandshakeError::MissedHeader("connection".to_owned()))?;
+        let conn = data.headers.get("connection").ok_or_else(|| HandshakeError::MissedHeader("connection".to_owned()))?;
         if conn.to_lowercase() != "upgrade" {
             return Err(HandshakeError::BadHeaderValue("connection".to_owned(), conn.to_owned()))
         }
         // Check upgrade header
-        let upg = data.headers.get("upgrade").ok_or(HandshakeError::MissedHeader("upgrade".to_owned()))?;
+        let upg = data.headers.get("upgrade").ok_or_else(|| HandshakeError::MissedHeader("upgrade".to_owned()))?;
         if upg.to_lowercase() != "websocket" {
             return Err(HandshakeError::BadHeaderValue("upgrade".to_owned(), upg.to_owned()))
         }
 
         // Calculating Sec-WebSocket-Accept key
         let key = data.headers.get("sec-websocket-key")
-            .ok_or(HandshakeError::MissedHeader("sec-websocket-key".to_owned()))?;
+            .ok_or_else(|| HandshakeError::MissedHeader("sec-websocket-key".to_owned()))?;
 
         let mut hasher = Sha1::new();
         hasher.input_str(key);
@@ -108,7 +112,7 @@ impl WebsocketServer {
         ).await?;
 
         println!("Connected!!!!!1");
-        return Ok(());
+        Ok(())
 
 
     }
@@ -122,12 +126,9 @@ impl WebsocketServer {
         loop {
             let n = socket.read(&mut buff).await?;
             handshake.extend_from_slice(&buff[0..n]);
-            if handshake[n-2..n] == *"\r\n".as_bytes() {
+            if handshake[n-2..n] == *b"\r\n" ||
+                prev_packet_ind != 0 && handshake[prev_packet_ind-1..prev_packet_ind+1] == *b"\r\n" {
                 break;
-            } else if prev_packet_ind != 0 {
-                if handshake[prev_packet_ind-1..prev_packet_ind+1] == *"\r\n".as_bytes() {
-                    break;
-                }
             }
             prev_packet_ind += n;
             if n == 0 {
@@ -142,7 +143,7 @@ impl WebsocketServer {
         let mut res = WebsocketData::default();
         // TODO: URLdecode
         let path = req.path.ok_or(HandshakeError::BadRequest)?;
-        let q_index = memchr(b'?', path.as_bytes()).unwrap_or(path.len());
+        let q_index = memchr(b'?', path.as_bytes()).unwrap_or_else(|| path.len());
         res.path = path[0..q_index].to_string();
 
         // query string processing

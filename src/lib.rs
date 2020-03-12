@@ -1,6 +1,6 @@
 pub mod websocket;
 pub fn kappa() -> u64 {
-    return 1337*1488;
+    1337*1488
 }
 
 #[cfg(test)]
