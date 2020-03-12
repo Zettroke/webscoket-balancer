@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use memchr::memchr;
 use crypto::sha1::Sha1;
 use crypto::digest::Digest;
+use httparse::Header;
 
 #[derive(Default, Debug)]
 struct WebsocketData {
@@ -61,18 +62,18 @@ impl WebsocketServer {
             }
         };
 
-        if !data.headers.get("Connection").map_or(false, |v| v.to_lowercase() == "upgrade") {
+        println!("{:#?}", data);
+        if !data.headers.get("connection").map_or(false, |v| v.to_lowercase() == "upgrade") {
             return;
         }
-        if !data.headers.get("Upgrade").map_or(false, |v| v.to_lowercase() == "websocket") {
+        if !data.headers.get("upgrade").map_or(false, |v| v.to_lowercase() == "websocket") {
             return;
         }
 
-        let resp_key = if let Some(key) = data.headers.get("Sec-WebSocket-Key") {
-            let mut decoded_key = base64::decode(key).unwrap();
-            decoded_key.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let resp_key = if let Some(key) = data.headers.get("sec-websocket-key") {
+            let resp_key = key.to_owned() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
             let mut hasher = Sha1::new();
-            hasher.input(decoded_key.as_slice());
+            hasher.input_str(resp_key.as_str());
             let mut output = [0u8; 20];
             hasher.result(&mut output);
             base64::encode(output)
@@ -80,26 +81,21 @@ impl WebsocketServer {
             return;
         };
 
-        socket.write(format!("\
-        HTTP/1.1 101 Switching Protocols\r\n\
-        Upgrade: websocket\r\n\
-        Connection: Upgrade\r\n\
-        Sec-WebSocket-Accept: {}\r\n\
-        \r\n\r\n
-        ", resp_key).as_bytes()).await.unwrap();
+        socket.write(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", resp_key).as_bytes()).await.unwrap();
 
         println!("Connected!!!!!1");
         let mut buff = [0u8; 1024];
         loop {
             socket.read(&mut buff).await.unwrap();
+            println!("msg!");
         }
 
 
     }
 
     async fn receive_handshake_data(socket: &mut TcpStream) -> Result<WebsocketData, ()> {
-        let mut handshake: Vec<u8> = Vec::with_capacity(1024);
-        let mut buff = [0; 1024];
+        let mut handshake: Vec<u8> = Vec::with_capacity(2048);
+        let mut buff = [0; 2048];
         let mut prev_packet_ind: usize = 0;
 
         // handshake
@@ -156,6 +152,9 @@ impl WebsocketServer {
 
         // header processing
         for h in headers.iter() {
+            if *h == httparse::EMPTY_HEADER {
+                break;
+            }
             match String::from_utf8(h.value.to_vec()) {
                 Ok(v) => res.headers.insert(h.name.to_lowercase(), v),
                 Err(_) => continue
@@ -165,6 +164,6 @@ impl WebsocketServer {
 
         // socket.write(format!("HTTP/1.1 200\r\n\r\n<pre>{:#?}</pre>\r\n", res).as_bytes()).await;
 
-        Ok(WebsocketData::default())
+        Ok(res)
     }
 }
