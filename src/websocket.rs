@@ -9,7 +9,14 @@ use memchr::memchr;
 use crypto::sha1::Sha1;
 use crypto::digest::Digest;
 use thiserror::Error;
-// use core::slice::memchr::memchr;
+use std::ops::BitXorAssign;
+
+trait MessageAdapter {
+    type Message;
+    fn decode(msg: RawMessage) -> Self::Message;
+
+    fn encode(msg: Self::Message) -> RawMessage;
+}
 
 #[derive(Error, Debug)]
 enum HandshakeError {
@@ -27,6 +34,39 @@ enum HandshakeError {
     IOError(#[from] std::io::Error),
 }
 
+#[derive(Error, Debug)]
+#[error("Bad formatted message")]
+enum MessageError{
+    #[error("Socket error while reading message: {0:?}")]
+    Socket(#[from] std::io::Error),
+    #[error("Bad message format")]
+    Format
+}
+
+
+
+
+struct RawMessage {
+    fin: bool,
+    opcode: u8,
+    mask: bool,
+    mask_key: u32,
+    payload: Vec<u8>
+}
+
+// impl Default for RawMessage {
+//     fn default() -> Self {
+//         RawMessage {
+//             fin: true,
+//             opcode: 0,
+//             mask: false,
+//             mask_key: 0,
+//             payload: Vec::new()
+//         }
+//     }
+// }
+
+
 
 #[derive(Default, Debug)]
 struct WebsocketData {
@@ -36,49 +76,103 @@ struct WebsocketData {
     query_params: HashMap<String, String>
 }
 
-struct WebsocketServerState {
+struct WebsocketServerInner {
     _received: AtomicU64
+
 }
 
-pub struct WebsocketServer {
-    addr: SocketAddr,
-    state: Arc<WebsocketServerState>
+struct MessageReceiver {
+    header_buff: [u8; 16],
+
 }
 
-impl Default for WebsocketServer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+impl WebsocketServerInner {
+    async fn handler(self: Arc<WebsocketServerInner>, mut socket: TcpStream) {
+        self.handshake(&mut socket).await.unwrap();
 
-impl WebsocketServer {
-
-    pub fn new() -> Self {
-        WebsocketServer {
-            addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080)),
-            state: Arc::new(WebsocketServerState { _received: AtomicU64::new(0)})
-        }
-    }
-
-    pub fn address<T: ToSocketAddrs>(&mut self, addr: T) -> &mut Self {
-        self.addr = addr.to_socket_addrs().expect("Failed converting socket address!!!").next().unwrap();
-        self
-    }
-
-    pub async fn run(&mut self) {
-        let mut l = TcpListener::bind(self.addr).await.unwrap();
         loop {
-            let (sock, _addr) = l.accept().await.unwrap();
-            tokio::spawn(Self::handler(self.state.clone(), sock));
+            self.next_message(&mut socket).await;
         }
     }
 
-    async fn handler(_this: Arc<WebsocketServerState>, mut socket: TcpStream) {
-        WebsocketServer::handshake(&mut socket).await.unwrap();
+
+    async fn next_message(&self, socket: &mut TcpStream) -> Result<RawMessage, MessageError> {
+        // read from socket until n bytes will be in buff
+
+
+        let mut cur: usize = 0;
+        let mut fin = false;
+        let mut opcode: u8 = 0;
+        let mut mask = false;
+        let mut mask_key = [0u8; 4];
+        let mut buff = [0u8; 16];
+
+        macro_rules! read_until {
+            ($n:expr) => {
+                while cur < $n {
+                    cur += socket.read(&mut buff[cur..16]).await?;
+                }
+            };
+        }
+
+        read_until!(2);
+        fin = buff[0] & 0b1000_0000 != 0;
+        opcode = buff[0] & 0b0000_1111;
+        mask = buff[1] & 0b1000_0000 != 0;
+        let short_payload_len = (buff[1] & 0b0111_1111) as u16;
+
+        let (size_end, payload_len) = match short_payload_len {
+            126 => {
+                read_until!(4);
+                let mut tmp = [0u8; 2];
+                tmp.copy_from_slice(&buff[2..4]);
+
+                (4, u16::from_be_bytes(tmp) as u64)
+            },
+            127 => {
+                read_until!(10);
+                let mut tmp = [0u8; 8];
+                tmp.copy_from_slice(&buff[2..10]);
+
+                (10, u64::from_be_bytes(tmp))
+            },
+            v => (2, v as u64)
+        };
+
+        if mask {
+            read_until!(size_end + 4);
+
+            mask_key.copy_from_slice(&buff[size_end..size_end+4]);
+        }
+        let header_end = size_end + 4;
+
+        let mut payload_buff = vec![0u8; payload_len as usize];
+
+        if header_end < cur {
+            payload_buff[0..cur-header_end].copy_from_slice(&mut buff[header_end..cur]);
+        }
+
+        if cur - header_end < payload_buff.len() {
+            socket.read_exact(&mut payload_buff[cur-header_end..payload_len as usize]).await?;
+        }
+
+
+        println!("Message with payload len: {}", payload_len);
+        println!("Masking key: {:?}", mask_key);
+
+        for b in payload_buff.iter_mut().enumerate() {
+            *b.1 ^= mask_key[b.0 % 4];
+        }
+
+        println!("payload_buff: {:?}", payload_buff);
+        println!("payload: {}", String::from_utf8(payload_buff).unwrap_or(String::from("")));
+
+        return Err(MessageError::Format)
     }
 
-    async fn handshake(socket: &mut TcpStream) -> Result<(), HandshakeError> {
-        let data = Self::receive_handshake_data(socket).await?;
+
+    async fn handshake(&self, socket: &mut TcpStream) -> Result<(), HandshakeError> {
+        let data = self.receive_handshake_data(socket).await?;
 
         // Check connection header
         let conn = data.headers.get("connection").ok_or_else(|| HandshakeError::MissedHeader("connection".to_owned()))?;
@@ -117,7 +211,7 @@ impl WebsocketServer {
 
     }
 
-    async fn receive_handshake_data(socket: &mut TcpStream) -> Result<WebsocketData, HandshakeError> {
+    async fn receive_handshake_data(&self, socket: &mut TcpStream) -> Result<WebsocketData, HandshakeError> {
         let mut handshake: Vec<u8> = Vec::with_capacity(2048);
         let mut buff = [0; 2048];
         let mut prev_packet_ind: usize = 0;
@@ -177,5 +271,39 @@ impl WebsocketServer {
         }
 
         Ok(res)
+    }
+}
+
+pub struct WebsocketServer {
+    addr: SocketAddr,
+    state: Arc<WebsocketServerInner>
+}
+
+impl Default for WebsocketServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebsocketServer {
+
+    pub fn new() -> Self {
+        WebsocketServer {
+            addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080)),
+            state: Arc::new(WebsocketServerInner { _received: AtomicU64::new(0)})
+        }
+    }
+
+    pub fn address<T: ToSocketAddrs>(&mut self, addr: T) -> &mut Self {
+        self.addr = addr.to_socket_addrs().expect("Failed converting socket address!!!").next().unwrap();
+        self
+    }
+
+    pub async fn run(&mut self) {
+        let mut l = TcpListener::bind(self.addr).await.unwrap();
+        loop {
+            let (sock, _addr) = l.accept().await.unwrap();
+            tokio::spawn(WebsocketServerInner::handler(self.state.clone(), sock));
+        }
     }
 }
