@@ -109,9 +109,6 @@ impl WebsocketServerInner {
         }
     }
 
-
-    async fn send_message(&self, msg: RawMessage, )
-
     async fn next_message(&self, socket: &mut TcpStream) -> Result<RawMessage, MessageError> {
         // read from socket until n bytes will be in buff
 
