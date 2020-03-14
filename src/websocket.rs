@@ -1,5 +1,5 @@
 extern crate memchr;
-use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, Ipv4Addr};
+use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, Ipv4Addr, Shutdown};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::atomic::{AtomicU64};
@@ -10,6 +10,10 @@ use crypto::sha1::Sha1;
 use crypto::digest::Digest;
 use thiserror::Error;
 use std::ops::BitXorAssign;
+use std::u64::MAX;
+use crate::websocket::MessageError::MessageTooBig;
+
+static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
 
 trait MessageAdapter {
     type Message;
@@ -35,38 +39,47 @@ enum HandshakeError {
 }
 
 #[derive(Error, Debug)]
-#[error("Bad formatted message")]
 enum MessageError{
     #[error("Socket error while reading message: {0:?}")]
     Socket(#[from] std::io::Error),
     #[error("Bad message format")]
-    Format
+    Format,
+    #[error("Message size: {size} bytes too big. Max size is {max_size}")]
+    MessageTooBig { size: u64, max_size: u64 }
 }
 
+#[derive(Debug, Clone)]
+enum MessageOpCode {
+    ContinuationFrame = 0,
+    TextFrame = 1,
+    BinaryFrame = 2,
+    Close = 8,
+    Ping = 9,
+    Pong = 10,
+    Unknown = 15
+}
 
-
+impl From<u8> for MessageOpCode {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => Self::ContinuationFrame,
+            1 => Self::TextFrame,
+            2 => Self::BinaryFrame,
+            8 => Self::Close,
+            9 => Self::Ping,
+            10 => Self::Pong,
+            _ => Self::Unknown
+        }
+    }
+}
 
 struct RawMessage {
     fin: bool,
-    opcode: u8,
+    opcode: MessageOpCode,
     mask: bool,
-    mask_key: u32,
+    mask_key: [u8; 4],
     payload: Vec<u8>
 }
-
-// impl Default for RawMessage {
-//     fn default() -> Self {
-//         RawMessage {
-//             fin: true,
-//             opcode: 0,
-//             mask: false,
-//             mask_key: 0,
-//             payload: Vec::new()
-//         }
-//     }
-// }
-
-
 
 #[derive(Default, Debug)]
 struct WebsocketData {
@@ -81,20 +94,23 @@ struct WebsocketServerInner {
 
 }
 
-struct MessageReceiver {
-    header_buff: [u8; 16],
-
-}
-
 impl WebsocketServerInner {
     async fn handler(self: Arc<WebsocketServerInner>, mut socket: TcpStream) {
         self.handshake(&mut socket).await.unwrap();
-
         loop {
-            self.next_message(&mut socket).await;
+            let msg = match self.next_message(&mut socket).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    eprintln!("Message error: {}\nClosing connection!", e);
+                    socket.shutdown(Shutdown::Both).await; // TODO: Correct closing with message sent
+                    return;
+                },
+            };
         }
     }
 
+
+    async fn send_message(&self, msg: RawMessage, )
 
     async fn next_message(&self, socket: &mut TcpStream) -> Result<RawMessage, MessageError> {
         // read from socket until n bytes will be in buff
@@ -106,20 +122,22 @@ impl WebsocketServerInner {
         let mut mask = false;
         let mut mask_key = [0u8; 4];
         let mut buff = [0u8; 16];
-
         macro_rules! read_until {
             ($n:expr) => {
                 while cur < $n {
-                    cur += socket.read(&mut buff[cur..16]).await?;
+                    let n = socket.read(&mut buff[cur..16]).await?;
+                    if n == 0 { return Err(MessageError::Socket(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "socket was closed!"))) }
+                    cur += n;
                 }
             };
         }
 
         read_until!(2);
         fin = buff[0] & 0b1000_0000 != 0;
-        opcode = buff[0] & 0b0000_1111;
+        let opcode = MessageOpCode::from(buff[0] & 0b0000_1111);
         mask = buff[1] & 0b1000_0000 != 0;
         let short_payload_len = (buff[1] & 0b0111_1111) as u16;
+        println!("fin: {}, opcode: {:?} - {}, short_payload_len: {}", fin, opcode, opcode.clone() as u8, short_payload_len);
 
         let (size_end, payload_len) = match short_payload_len {
             126 => {
@@ -139,6 +157,10 @@ impl WebsocketServerInner {
             v => (2, v as u64)
         };
 
+        if payload_len > MAX_MESSAGE_SIZE {
+            return Err(MessageTooBig { size: payload_len, max_size: MAX_MESSAGE_SIZE });
+        }
+
         if mask {
             read_until!(size_end + 4);
 
@@ -156,20 +178,19 @@ impl WebsocketServerInner {
             socket.read_exact(&mut payload_buff[cur-header_end..payload_len as usize]).await?;
         }
 
-
-        println!("Message with payload len: {}", payload_len);
-        println!("Masking key: {:?}", mask_key);
-
         for b in payload_buff.iter_mut().enumerate() {
             *b.1 ^= mask_key[b.0 % 4];
         }
 
-        println!("payload_buff: {:?}", payload_buff);
-        println!("payload: {}", String::from_utf8(payload_buff).unwrap_or(String::from("")));
-
-        return Err(MessageError::Format)
+        println!("payload: {}", String::from_utf8(payload_buff.clone()).unwrap_or(String::from("")));
+        return Ok(RawMessage {
+            fin,
+            mask,
+            mask_key,
+            opcode,
+            payload: payload_buff
+        });
     }
-
 
     async fn handshake(&self, socket: &mut TcpStream) -> Result<(), HandshakeError> {
         let data = self.receive_handshake_data(socket).await?;

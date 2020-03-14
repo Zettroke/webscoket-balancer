@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.js"></script>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+<div>websocket: <span id="status">closed</span></div>
+<button id="open-socket">open</button>
+<div>
+    <label>
+        Enter a message
+        <input id="msg">
+    </label>
+    <button id="send-msg">send message</button>
+</div>
+
+<div style="margin-top: 20px">
+    <label>
+        length
+        <input id="cnt" type="number">
+    </label>
+    <button id="send-cnt">send random message</button>
+</div>
+</body>
+<script>
+    function makeid(length) {
+        let result = '';
+        const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        const charactersLength = characters.length;
+        for ( var i = 0; i < length; i++ ) {
+            result += characters.charAt(Math.floor(Math.random() * charactersLength));
+        }
+        return result;
+    }
+    let url = 'ws://127.0.0.1:1337/some/random/path/to/websocket';
+
+    let ws;
+    $('#open-socket').click(() => {
+        if (ws) {
+            ws.close();
+        }
+
+        ws = new WebSocket(url);
+        ws.onopen = ev => {
+            $('#status').text("OPENED");
+        };
+        ws.onclose = ev => {
+            $('#status').text("CLOSED");
+        };
+    });
+
+    $('#msg').keypress(e => {
+        if (e.keyCode === 13) {
+            if (ws && !ws.closed) {
+                ws.send($('#msg').val());
+            }
+        }
+    });
+    $('#send-msg').click(() => {
+        if (ws && !ws.closed) {
+            ws.send($('#msg').val());
+        }
+    })
+
+
+</script>
+
+</html>
