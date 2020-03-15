@@ -1,7 +1,7 @@
 extern crate memchr;
 use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, Ipv4Addr, Shutdown};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
 use std::sync::atomic::{AtomicU64};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -9,9 +9,14 @@ use memchr::memchr;
 use crypto::sha1::Sha1;
 use crypto::digest::Digest;
 use thiserror::Error;
-use std::ops::BitXorAssign;
-use std::u64::MAX;
+use tokio::join;
+use tokio::sync::{mpsc, Mutex};
 use crate::websocket::MessageError::MessageTooBig;
+use tokio::net::tcp::{ReadHalf, WriteHalf};
+use futures::future::{abortable, AbortHandle};
+use std::fmt::{Debug, Formatter};
+use rand::distributions::weighted::alias_method::Weight;
+use bytes::{BufMut, Buf};
 
 static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
 
@@ -72,7 +77,7 @@ impl From<u8> for MessageOpCode {
         }
     }
 }
-
+#[derive(Debug)]
 struct RawMessage {
     fin: bool,
     opcode: MessageOpCode,
@@ -81,105 +86,125 @@ struct RawMessage {
     payload: Vec<u8>
 }
 
-#[derive(Default, Debug)]
-struct WebsocketData {
+#[derive(Default)]
+pub struct WebsocketData {
+    id: u128,
     path: String,
     /// Header name(key) is lowercase
     headers: HashMap<String, String>,
     query_params: HashMap<String, String>
 }
 
-struct WebsocketServerInner {
-    _received: AtomicU64
+impl Debug for WebsocketData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_struct("")
+            .field("id", &format!("{:X}", self.id))
+            .field("path", &self.path)
+            .field("headers", &self.headers)
+            .field("query_params", &self.query_params);
 
+        return Ok(())
+    }
 }
 
-impl WebsocketServerInner {
-    async fn handler(self: Arc<WebsocketServerInner>, mut socket: TcpStream) {
-        self.handshake(&mut socket).await.unwrap();
+
+struct WebsocketConnection {
+    data: Arc<WebsocketData>,
+
+    recv_handle: AbortHandle,
+    send_handle: AbortHandle
+}
+
+impl WebsocketConnection {
+    async fn receive_loop(_data: Arc<WebsocketData>, read_half: ReadHalf<'_>, mut sink: mpsc::Sender<RawMessage>) {
+        let mut r = BufReader::new(read_half);
         loop {
-            let msg = match self.next_message(&mut socket).await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    eprintln!("Message error: {}\nClosing connection!", e);
-                    socket.shutdown(Shutdown::Both).await; // TODO: Correct closing with message sent
-                    return;
+            let msg = match WebsocketConnection::next_message(&mut r).await {
+                Ok(msg) => {
+                    println!("msg: {:?}", msg);
+                    msg
                 },
+                Err(_) => return
             };
+            if let MessageOpCode::Close = msg.opcode {
+                return;
+            } else {
+                sink.send(msg).await.unwrap();
+            }
         }
     }
 
-    async fn next_message(&self, socket: &mut TcpStream) -> Result<RawMessage, MessageError> {
-        // read from socket until n bytes will be in buff
+    async fn send_loop(_data: Arc<WebsocketData>, mut write_half: WriteHalf<'_>, mut source: mpsc::Receiver<RawMessage>) {
+        let mut out = bytes::BytesMut::new();
+        // let mut writer = BufWriter::new(write_half);
+        loop {
+            let v = source.recv().await;
+            println!("got message {:?}", v);
+            if let Some(mut msg) = v {
+                out.put_u8((msg.fin as u8) << 7 | (msg.opcode as u8));
 
-
-        let mut cur: usize = 0;
-        let mut fin = false;
-        let mut opcode: u8 = 0;
-        let mut mask = false;
-        let mut mask_key = [0u8; 4];
-        let mut buff = [0u8; 16];
-        macro_rules! read_until {
-            ($n:expr) => {
-                while cur < $n {
-                    let n = socket.read(&mut buff[cur..16]).await?;
-                    if n == 0 { return Err(MessageError::Socket(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "socket was closed!"))) }
-                    cur += n;
+                if msg.payload.len() <= 125 {
+                    out.put_u8(msg.payload.len() as u8);
+                } else if msg.payload.len() < u16::MAX as usize {
+                    out.put_u8(126);
+                    out.put_u16(msg.payload.len() as u16);
+                } else {
+                    out.put_u8(127);
+                    out.put_u64(msg.payload.len() as u64);
                 }
-            };
+
+                if msg.mask {
+                    for (ind, v) in msg.payload.iter_mut().enumerate() {
+                        *v = *v ^ msg.mask_key[ind % 4];
+                    }
+                }
+                out.put(msg.payload.as_slice());
+                write_half.write(out.bytes()).await.unwrap();
+                // write_half.write(msg.payload.as_slice()).await;
+                out.clear()
+            } else {
+                return;
+            }
         }
+    }
 
-        read_until!(2);
-        fin = buff[0] & 0b1000_0000 != 0;
-        let opcode = MessageOpCode::from(buff[0] & 0b0000_1111);
-        mask = buff[1] & 0b1000_0000 != 0;
-        let short_payload_len = (buff[1] & 0b0111_1111) as u16;
-        println!("fin: {}, opcode: {:?} - {}, short_payload_len: {}", fin, opcode, opcode.clone() as u8, short_payload_len);
+    async fn next_message(reader: &mut BufReader<ReadHalf<'_>>) -> Result<RawMessage, MessageError> {
 
-        let (size_end, payload_len) = match short_payload_len {
+        let mut mask_key = [0u8; 4];
+        let v = reader.read_u16().await?;
+
+        let fin = v & (1 << 15) != 0;
+
+        let opcode_v = ((v & (0b0000_1111 << 8)) >> 8) as u8;
+        let opcode = MessageOpCode::from(opcode_v);
+
+        let mask = v & 0b1000_0000 != 0;
+
+        let short_payload_len = (v & 0b0111_1111) as u8;
+
+        // println!("fin: {}, opcode: {:?} - {}, short_payload_len: {}", fin, opcode, opcode_v as u8, short_payload_len);
+
+        let payload_len = match short_payload_len {
             126 => {
-                read_until!(4);
-                let mut tmp = [0u8; 2];
-                tmp.copy_from_slice(&buff[2..4]);
-
-                (4, u16::from_be_bytes(tmp) as u64)
+                reader.read_u16().await? as u64
             },
             127 => {
-                read_until!(10);
-                let mut tmp = [0u8; 8];
-                tmp.copy_from_slice(&buff[2..10]);
-
-                (10, u64::from_be_bytes(tmp))
+                reader.read_u64().await?
             },
-            v => (2, v as u64)
+            v => v as u64
         };
-
         if payload_len > MAX_MESSAGE_SIZE {
             return Err(MessageTooBig { size: payload_len, max_size: MAX_MESSAGE_SIZE });
         }
 
         if mask {
-            read_until!(size_end + 4);
-
-            mask_key.copy_from_slice(&buff[size_end..size_end+4]);
+            reader.read(&mut mask_key).await?;
         }
-        let header_end = size_end + 4;
 
         let mut payload_buff = vec![0u8; payload_len as usize];
 
-        if header_end < cur {
-            payload_buff[0..cur-header_end].copy_from_slice(&mut buff[header_end..cur]);
-        }
+        reader.read(payload_buff.as_mut_slice()).await?;
 
-        if cur - header_end < payload_buff.len() {
-            socket.read_exact(&mut payload_buff[cur-header_end..payload_len as usize]).await?;
-        }
-
-        for b in payload_buff.iter_mut().enumerate() {
-            *b.1 ^= mask_key[b.0 % 4];
-        }
-
-        println!("payload: {}", String::from_utf8(payload_buff.clone()).unwrap_or(String::from("")));
         return Ok(RawMessage {
             fin,
             mask,
@@ -188,8 +213,46 @@ impl WebsocketServerInner {
             payload: payload_buff
         });
     }
+}
 
-    async fn handshake(&self, socket: &mut TcpStream) -> Result<(), HandshakeError> {
+struct WebsocketServerInner {
+    _received: AtomicU64,
+    connections: Mutex<Vec<WebsocketConnection>>
+}
+
+impl WebsocketServerInner {
+    async fn handler(self: Arc<WebsocketServerInner>, mut socket: TcpStream) {
+        let mut d = self.handshake(&mut socket).await.unwrap();
+        d.id = rand::random();
+        let data = Arc::new(d);
+
+        let (tx, rx) = mpsc::channel::<RawMessage>(5);
+        {
+            let (r, w) = socket.split();
+            let (recv_fut, recv_handle) = abortable(
+                WebsocketConnection::receive_loop(data.clone(), r, tx)
+            );
+            let (send_fut, send_handle) = abortable(
+                WebsocketConnection::send_loop(data.clone(), w, rx)
+            );
+            let conn = WebsocketConnection {
+                data: data.clone(),
+                recv_handle,
+                send_handle,
+            };
+            self.connections.lock().await.push(conn);
+
+            join!(recv_fut, send_fut);
+
+            let mut arr = self.connections.lock().await;
+            if let Some(ind) = arr.iter().position(|v| v.data.id == data.id) {
+                arr.remove(ind);
+            }
+        }
+        socket.shutdown(Shutdown::Both).unwrap();
+    }
+
+    async fn handshake(&self, socket: &mut TcpStream) -> Result<WebsocketData, HandshakeError> {
         let data = self.receive_handshake_data(socket).await?;
 
         // Check connection header
@@ -223,10 +286,7 @@ impl WebsocketServerInner {
             \r\n", resp_key).as_bytes()
         ).await?;
 
-        println!("Connected!!!!!1");
-        Ok(())
-
-
+        Ok(data)
     }
 
     async fn receive_handshake_data(&self, socket: &mut TcpStream) -> Result<WebsocketData, HandshakeError> {
@@ -308,7 +368,7 @@ impl WebsocketServer {
     pub fn new() -> Self {
         WebsocketServer {
             addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080)),
-            state: Arc::new(WebsocketServerInner { _received: AtomicU64::new(0)})
+            state: Arc::new(WebsocketServerInner { _received: AtomicU64::new(0), connections: Mutex::new(Vec::new())})
         }
     }
 
@@ -318,6 +378,54 @@ impl WebsocketServer {
     }
 
     pub async fn run(&mut self) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut v = String::new();
+                let mut reader = BufReader::new(tokio::io::stdin());
+                reader.read_line(&mut v).await.unwrap();
+                v.remove(v.len()-1);
+                let res: Vec<&str> = v.split(' ').collect();
+                // println!("Red \"{}\" line!", v);
+                match res[0] {
+                    "p" => {
+                        let arr = state.connections.lock().await;
+                        if arr.len() == 0 {
+                            println!("There are no connections!");
+                        } else {
+                            println!("Connections:")
+                        }
+                        for conn in arr.iter() {
+                            println!("{:?}", conn.data);
+                        }
+                    },
+                    "close" => {
+                        if res.len() == 2 {
+                            let arr = state.connections.lock().await;
+                            let found: Vec<&WebsocketConnection> = arr.iter().filter(|v| {
+                                format!("{:X}", v.data.id).starts_with(res[1])
+                            }).collect();
+                            if found.len() > 1 {
+                                println!("Found multiple connection. Enter more accurate id.");
+                                for v in found.iter() {
+                                    println!("{:X}", v.data.id);
+                                }
+                            } else {
+                                found[0].recv_handle.abort();
+                            }
+                        }
+                        println!("close");
+                    },
+                    "help" => {
+                        println!("p - prints current connections")
+                    }
+                    _ => {
+                        println!("Unknown command!");
+                    }
+                }
+                // println!("{}", v);
+            }
+        });
         let mut l = TcpListener::bind(self.addr).await.unwrap();
         loop {
             let (sock, _addr) = l.accept().await.unwrap();
