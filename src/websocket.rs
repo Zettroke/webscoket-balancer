@@ -2,23 +2,21 @@ extern crate memchr;
 use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, Ipv4Addr, Shutdown};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
-use std::sync::atomic::{AtomicU64};
 use std::sync::Arc;
 use std::collections::HashMap;
 use memchr::memchr;
 use crypto::sha1::Sha1;
 use crypto::digest::Digest;
 use thiserror::Error;
-use tokio::join;
+use tokio::select;
 use tokio::sync::{mpsc, Mutex};
-use crate::websocket::MessageError::MessageTooBig;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use futures::future::{abortable, AbortHandle};
 use std::fmt::{Debug, Formatter};
-use rand::distributions::weighted::alias_method::Weight;
 use bytes::{BufMut, Buf};
+use crate::ServerChannel;
 
-static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
+pub static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
 
 trait MessageAdapter {
     type Message;
@@ -43,18 +41,9 @@ enum HandshakeError {
     IOError(#[from] std::io::Error),
 }
 
-#[derive(Error, Debug)]
-enum MessageError{
-    #[error("Socket error while reading message: {0:?}")]
-    Socket(#[from] std::io::Error),
-    #[error("Bad message format")]
-    Format,
-    #[error("Message size: {size} bytes too big. Max size is {max_size}")]
-    MessageTooBig { size: u64, max_size: u64 }
-}
 
 #[derive(Debug, Clone)]
-enum MessageOpCode {
+pub enum MessageOpCode {
     ContinuationFrame = 0,
     TextFrame = 1,
     BinaryFrame = 2,
@@ -78,21 +67,21 @@ impl From<u8> for MessageOpCode {
     }
 }
 #[derive(Debug)]
-struct RawMessage {
-    fin: bool,
-    opcode: MessageOpCode,
-    mask: bool,
-    mask_key: [u8; 4],
-    payload: Vec<u8>
+pub struct RawMessage {
+    pub fin: bool,
+    pub opcode: MessageOpCode,
+    pub mask: bool,
+    pub mask_key: [u8; 4],
+    pub payload: Vec<u8>
 }
 
 #[derive(Default)]
 pub struct WebsocketData {
-    id: u128,
-    path: String,
+    pub id: u128,
+    pub path: String,
     /// Header name(key) is lowercase
-    headers: HashMap<String, String>,
-    query_params: HashMap<String, String>
+    pub headers: HashMap<String, String>,
+    pub query_params: HashMap<String, String>
 }
 
 impl Debug for WebsocketData {
@@ -111,113 +100,49 @@ impl Debug for WebsocketData {
 struct WebsocketConnection {
     data: Arc<WebsocketData>,
 
-    recv_handle: AbortHandle,
-    send_handle: AbortHandle
+    handle: AbortHandle,
 }
 
 impl WebsocketConnection {
     async fn receive_loop(_data: Arc<WebsocketData>, read_half: ReadHalf<'_>, mut sink: mpsc::Sender<RawMessage>) {
         let mut r = BufReader::new(read_half);
         loop {
-            let msg = match WebsocketConnection::next_message(&mut r).await {
+            let msg = match crate::websocket_util::receive_message(&mut r).await {
                 Ok(msg) => {
                     println!("msg: {:?}", msg);
                     msg
                 },
-                Err(_) => return
+                Err(_) => {
+                    println!("failed");
+                    return;
+                }
             };
             if let MessageOpCode::Close = msg.opcode {
                 return;
             } else {
                 sink.send(msg).await.unwrap();
+                println!("sended msg");
             }
         }
     }
 
     async fn send_loop(_data: Arc<WebsocketData>, mut write_half: WriteHalf<'_>, mut source: mpsc::Receiver<RawMessage>) {
-        let mut out = bytes::BytesMut::new();
-        // let mut writer = BufWriter::new(write_half);
         loop {
             let v = source.recv().await;
-            println!("got message {:?}", v);
             if let Some(mut msg) = v {
-                out.put_u8((msg.fin as u8) << 7 | (msg.opcode as u8));
-
-                if msg.payload.len() <= 125 {
-                    out.put_u8(msg.payload.len() as u8);
-                } else if msg.payload.len() < u16::MAX as usize {
-                    out.put_u8(126);
-                    out.put_u16(msg.payload.len() as u16);
-                } else {
-                    out.put_u8(127);
-                    out.put_u64(msg.payload.len() as u64);
-                }
-
-                if msg.mask {
-                    for (ind, v) in msg.payload.iter_mut().enumerate() {
-                        *v = *v ^ msg.mask_key[ind % 4];
-                    }
-                }
-                out.put(msg.payload.as_slice());
-                write_half.write(out.bytes()).await.unwrap();
-                // write_half.write(msg.payload.as_slice()).await;
-                out.clear()
+                crate::websocket_util::send_message(msg, &mut write_half).await;
             } else {
                 return;
             }
         }
     }
-
-    async fn next_message(reader: &mut BufReader<ReadHalf<'_>>) -> Result<RawMessage, MessageError> {
-
-        let mut mask_key = [0u8; 4];
-        let v = reader.read_u16().await?;
-
-        let fin = v & (1 << 15) != 0;
-
-        let opcode_v = ((v & (0b0000_1111 << 8)) >> 8) as u8;
-        let opcode = MessageOpCode::from(opcode_v);
-
-        let mask = v & 0b1000_0000 != 0;
-
-        let short_payload_len = (v & 0b0111_1111) as u8;
-
-        // println!("fin: {}, opcode: {:?} - {}, short_payload_len: {}", fin, opcode, opcode_v as u8, short_payload_len);
-
-        let payload_len = match short_payload_len {
-            126 => {
-                reader.read_u16().await? as u64
-            },
-            127 => {
-                reader.read_u64().await?
-            },
-            v => v as u64
-        };
-        if payload_len > MAX_MESSAGE_SIZE {
-            return Err(MessageTooBig { size: payload_len, max_size: MAX_MESSAGE_SIZE });
-        }
-
-        if mask {
-            reader.read(&mut mask_key).await?;
-        }
-
-        let mut payload_buff = vec![0u8; payload_len as usize];
-
-        reader.read(payload_buff.as_mut_slice()).await?;
-
-        return Ok(RawMessage {
-            fin,
-            mask,
-            mask_key,
-            opcode,
-            payload: payload_buff
-        });
-    }
 }
 
-struct WebsocketServerInner {
-    _received: AtomicU64,
-    connections: Mutex<Vec<WebsocketConnection>>
+pub struct WebsocketServerInner {
+    // _received: AtomicU64,
+    addr: SocketAddr,
+    connections: Mutex<Vec<WebsocketConnection>>,
+    channel: Box<dyn ServerChannel + Send + Sync>
 }
 
 impl WebsocketServerInner {
@@ -226,29 +151,34 @@ impl WebsocketServerInner {
         d.id = rand::random();
         let data = Arc::new(d);
 
+        // receive pair
         let (tx, rx) = mpsc::channel::<RawMessage>(5);
+        // send pair
+        let (tx2, rx2) = mpsc::channel::<RawMessage>(5);
+
+        self.channel.websocket_created(data.clone(), rx, tx2).await;
+        let (r, w) = socket.split();
         {
-            let (r, w) = socket.split();
-            let (recv_fut, recv_handle) = abortable(
-                WebsocketConnection::receive_loop(data.clone(), r, tx)
-            );
-            let (send_fut, send_handle) = abortable(
-                WebsocketConnection::send_loop(data.clone(), w, rx)
-            );
+            let d = data.clone();
+            let (fut, handle) = abortable(async move {
+                select! {
+                    _ = WebsocketConnection::receive_loop(d.clone(), r, tx) => {}
+                    _ = WebsocketConnection::send_loop(d.clone(), w, rx2) => {}
+                }
+            });
             let conn = WebsocketConnection {
                 data: data.clone(),
-                recv_handle,
-                send_handle,
+                handle,
             };
             self.connections.lock().await.push(conn);
-
-            join!(recv_fut, send_fut);
-
+            // join!(recv_fut, send_fut);
+            fut.await;
+            println!("Kappa!");
             let mut arr = self.connections.lock().await;
-            if let Some(ind) = arr.iter().position(|v| v.data.id == data.id) {
-                arr.remove(ind);
-            }
+            arr.iter().position(|v| v.data.id == data.id).map(|v| arr.remove(v));
         }
+        self.channel.websocket_removed(data.clone()).await;
+        println!("closed");
         socket.shutdown(Shutdown::Both).unwrap();
     }
 
@@ -350,35 +280,9 @@ impl WebsocketServerInner {
 
         Ok(res)
     }
-}
 
-pub struct WebsocketServer {
-    addr: SocketAddr,
-    state: Arc<WebsocketServerInner>
-}
-
-impl Default for WebsocketServer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WebsocketServer {
-
-    pub fn new() -> Self {
-        WebsocketServer {
-            addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080)),
-            state: Arc::new(WebsocketServerInner { _received: AtomicU64::new(0), connections: Mutex::new(Vec::new())})
-        }
-    }
-
-    pub fn address<T: ToSocketAddrs>(&mut self, addr: T) -> &mut Self {
-        self.addr = addr.to_socket_addrs().expect("Failed converting socket address!!!").next().unwrap();
-        self
-    }
-
-    pub async fn run(&mut self) {
-        let state = self.state.clone();
+    pub async fn run(self: Arc<WebsocketServerInner>) {
+        let serv = self.clone();
         tokio::spawn(async move {
             loop {
                 let mut v = String::new();
@@ -389,19 +293,22 @@ impl WebsocketServer {
                 // println!("Red \"{}\" line!", v);
                 match res[0] {
                     "p" => {
-                        let arr = state.connections.lock().await;
+                        let arr = self.connections.lock().await;
                         if arr.len() == 0 {
                             println!("There are no connections!");
                         } else {
                             println!("Connections:")
                         }
-                        for conn in arr.iter() {
-                            println!("{:?}", conn.data);
+                        for conn in arr.iter().take(10) {
+                            println!("  {:?}", conn.data);
+                        }
+                        if arr.len() > 10 {
+                            println!("And {} more...", arr.len() - 10);
                         }
                     },
                     "close" => {
                         if res.len() == 2 {
-                            let arr = state.connections.lock().await;
+                            let arr = self.connections.lock().await;
                             let found: Vec<&WebsocketConnection> = arr.iter().filter(|v| {
                                 format!("{:X}", v.data.id).starts_with(res[1])
                             }).collect();
@@ -411,7 +318,7 @@ impl WebsocketServer {
                                     println!("{:X}", v.data.id);
                                 }
                             } else {
-                                found[0].recv_handle.abort();
+                                found[0].handle.abort();
                             }
                         }
                         println!("close");
@@ -423,13 +330,59 @@ impl WebsocketServer {
                         println!("Unknown command!");
                     }
                 }
-                // println!("{}", v);
             }
         });
-        let mut l = TcpListener::bind(self.addr).await.unwrap();
+        let mut l = TcpListener::bind(serv.addr).await.unwrap();
         loop {
             let (sock, _addr) = l.accept().await.unwrap();
-            tokio::spawn(WebsocketServerInner::handler(self.state.clone(), sock));
+            // serv.channel.websocket_created()
+            tokio::spawn(WebsocketServerInner::handler(serv.clone(), sock));
         }
     }
+}
+
+pub struct WebsocketServerBuilder {
+    addr: SocketAddr,
+    channel: Option<Box<dyn ServerChannel + Send + Sync>>
+    // state: Arc<WebsocketServerInner>
+}
+
+impl Default for WebsocketServerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebsocketServerBuilder {
+
+    pub fn new() -> Self {
+        WebsocketServerBuilder {
+            addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080)),
+            channel: None
+            // state: Arc::new(WebsocketServerInner {
+            //     // _received: AtomicU64::new(0),
+            //     connections: Mutex::new(Vec::new())
+            // })
+        }
+    }
+
+    pub fn address<T: ToSocketAddrs>(mut self, addr: T) -> Self {
+        self.addr = addr.to_socket_addrs().expect("Failed converting socket address!!!").next().unwrap();
+        self
+    }
+
+    pub fn channel(mut self, c: Box<dyn ServerChannel + Send + Sync>) -> Self {
+        self.channel = Some(c);
+        self
+    }
+
+    pub fn build(self) -> Arc<WebsocketServerInner> {
+        Arc::new(WebsocketServerInner {
+            connections: Mutex::new(Vec::new()),
+            channel: self.channel.unwrap(),
+            addr: self.addr
+        })
+    }
+
+
 }
