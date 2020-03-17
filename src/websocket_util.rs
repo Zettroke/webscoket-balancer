@@ -63,20 +63,22 @@ pub async fn send_message<T: AsyncWrite + Unpin>(mut msg: RawMessage, writer: &m
     let mut out = bytes::BytesMut::new();
     out.put_u8((msg.fin as u8) << 7 | (msg.opcode as u8));
 
+    let mask_v = (msg.mask as u8) << 7;
     if msg.payload.len() <= 125 {
-        out.put_u8(msg.payload.len() as u8);
+        out.put_u8(mask_v | msg.payload.len() as u8);
     } else if msg.payload.len() < u16::max_value() as usize {
-        out.put_u8(126);
+        out.put_u8(mask_v | 126);
         out.put_u16(msg.payload.len() as u16);
     } else {
-        out.put_u8(127);
+        out.put_u8(mask_v | 127);
         out.put_u64(msg.payload.len() as u64);
     }
 
     if msg.mask {
-        for (ind, v) in msg.payload.iter_mut().enumerate() {
-            *v = *v ^ msg.mask_key[ind % 4];
-        }
+        // for (ind, v) in msg.payload.iter_mut().enumerate() {
+        //     *v = *v ^ msg.mask_key[ind % 4];
+        // }
+        out.put_slice(&msg.mask_key);
     }
     out.put(msg.payload.as_slice());
     writer.write(out.bytes()).await.unwrap();

@@ -223,7 +223,6 @@ impl WebsocketServerInner {
         let mut handshake: Vec<u8> = Vec::with_capacity(2048);
         let mut buff = [0; 2048];
         let mut prev_packet_ind: usize = 0;
-
         // handshake
         loop {
             let n = socket.read(&mut buff).await?;
@@ -241,6 +240,7 @@ impl WebsocketServerInner {
 
         let mut req = httparse::Request::new(&mut headers);
         req.parse(handshake.as_slice())?;
+        println!("req: {:?}", req);
 
         let mut res = WebsocketData::default();
         // TODO: URLdecode
