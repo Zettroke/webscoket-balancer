@@ -9,7 +9,7 @@ use crypto::sha1::Sha1;
 use crypto::digest::Digest;
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock, RwLockReadGuard};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use futures::future::{abortable, AbortHandle};
 use std::fmt::{Debug, Formatter};
@@ -97,10 +97,10 @@ impl Debug for WebsocketData {
 }
 
 
-struct WebsocketConnection {
-    data: Arc<WebsocketData>,
+pub struct WebsocketConnection {
+    pub data: Arc<WebsocketData>,
 
-    handle: AbortHandle,
+    pub handle: AbortHandle,
 }
 
 impl WebsocketConnection {
@@ -109,7 +109,7 @@ impl WebsocketConnection {
         loop {
             let msg = match crate::websocket_util::receive_message(&mut r).await {
                 Ok(msg) => {
-                    println!("msg: {:?}", msg);
+                    // println!("msg: {:?}", msg);
                     msg
                 },
                 Err(_) => {
@@ -121,7 +121,7 @@ impl WebsocketConnection {
                 return;
             } else {
                 sink.send(msg).await.unwrap();
-                println!("sended msg");
+                // println!("sended msg");
             }
         }
     }
@@ -141,7 +141,7 @@ impl WebsocketConnection {
 pub struct WebsocketServerInner {
     // _received: AtomicU64,
     addr: SocketAddr,
-    connections: Mutex<Vec<WebsocketConnection>>,
+    connections: RwLock<Vec<WebsocketConnection>>,
     channel: Box<dyn ServerChannel + Send + Sync>
 }
 
@@ -170,15 +170,15 @@ impl WebsocketServerInner {
                 data: data.clone(),
                 handle,
             };
-            self.connections.lock().await.push(conn);
+            self.connections.write().await.push(conn);
             // join!(recv_fut, send_fut);
             fut.await;
-            println!("Kappa!");
-            let mut arr = self.connections.lock().await;
+            // println!("Kappa!");
+            let mut arr = self.connections.write().await;
             arr.iter().position(|v| v.data.id == data.id).map(|v| arr.remove(v));
         }
         self.channel.websocket_removed(data.clone()).await;
-        println!("closed");
+        // println!("closed");
         socket.shutdown(Shutdown::Both).unwrap();
     }
 
@@ -240,7 +240,7 @@ impl WebsocketServerInner {
 
         let mut req = httparse::Request::new(&mut headers);
         req.parse(handshake.as_slice())?;
-        println!("req: {:?}", req);
+        // println!("req: {:?}", req);
 
         let mut res = WebsocketData::default();
         // TODO: URLdecode
@@ -283,61 +283,21 @@ impl WebsocketServerInner {
 
     pub async fn run(self: Arc<WebsocketServerInner>) {
         let serv = self.clone();
-        tokio::spawn(async move {
+
+        let (fut, handle) = abortable(async move {
+            let mut l = TcpListener::bind(serv.addr).await.unwrap();
             loop {
-                let mut v = String::new();
-                let mut reader = BufReader::new(tokio::io::stdin());
-                reader.read_line(&mut v).await.unwrap();
-                v.remove(v.len()-1);
-                let res: Vec<&str> = v.split(' ').collect();
-                // println!("Red \"{}\" line!", v);
-                match res[0] {
-                    "p" => {
-                        let arr = self.connections.lock().await;
-                        if arr.len() == 0 {
-                            println!("There are no connections!");
-                        } else {
-                            println!("Connections:")
-                        }
-                        for conn in arr.iter().take(10) {
-                            println!("  {:?}", conn.data);
-                        }
-                        if arr.len() > 10 {
-                            println!("And {} more...", arr.len() - 10);
-                        }
-                    },
-                    "close" => {
-                        if res.len() == 2 {
-                            let arr = self.connections.lock().await;
-                            let found: Vec<&WebsocketConnection> = arr.iter().filter(|v| {
-                                format!("{:X}", v.data.id).starts_with(res[1])
-                            }).collect();
-                            if found.len() > 1 {
-                                println!("Found multiple connection. Enter more accurate id.");
-                                for v in found.iter() {
-                                    println!("{:X}", v.data.id);
-                                }
-                            } else {
-                                found[0].handle.abort();
-                            }
-                        }
-                        println!("close");
-                    },
-                    "help" => {
-                        println!("p - prints current connections")
-                    }
-                    _ => {
-                        println!("Unknown command!");
-                    }
-                }
+                let (sock, _addr) = l.accept().await.unwrap();
+                // serv.channel.websocket_created()
+                tokio::spawn(WebsocketServerInner::handler(serv.clone(), sock));
             }
         });
-        let mut l = TcpListener::bind(serv.addr).await.unwrap();
-        loop {
-            let (sock, _addr) = l.accept().await.unwrap();
-            // serv.channel.websocket_created()
-            tokio::spawn(WebsocketServerInner::handler(serv.clone(), sock));
-        }
+        fut.await;
+
+    }
+
+    pub async fn get_connections(&self) -> RwLockReadGuard<'_, Vec<WebsocketConnection>> {
+        self.connections.read().await
     }
 }
 
@@ -378,7 +338,7 @@ impl WebsocketServerBuilder {
 
     pub fn build(self) -> Arc<WebsocketServerInner> {
         Arc::new(WebsocketServerInner {
-            connections: Mutex::new(Vec::new()),
+            connections: RwLock::new(Vec::new()),
             channel: self.channel.unwrap(),
             addr: self.addr
         })

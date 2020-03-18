@@ -1,10 +1,10 @@
 use std::sync::{Arc};
 use crate::ServerChannel;
-use tokio::sync::mpsc::{Sender, Receiver};
 use futures::Future;
 use crate::websocket::{RawMessage, WebsocketData, MessageOpCode};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use futures::future::AbortHandle;
 use tokio::time::{delay_for, Duration};
 use futures::future::abortable;
@@ -14,51 +14,54 @@ use rand::Rng;
 use tokio::net::TcpStream;
 use thiserror::Error;
 use httparse::{Request, Header, Response};
-use std::fmt::Write;
+use std::fmt::{Write, Debug, Formatter, Pointer};
 use bytes::Buf;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::borrow::Borrow;
 use tokio::net::tcp::{WriteHalf, ReadHalf};
 use tokio::sync::RwLock;
+use std::cell::UnsafeCell;
 
 // #[derive(Error)]
 // pub enum LocationWebsocketError {
 //
 // }
 
+#[derive(Debug)]
 pub struct WsConnection {
     data: Arc<WebsocketData>,
-    abort_handle: AbortHandle
+    abort_handle: AbortHandle,
+    channels: oneshot::Receiver<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>
 }
 
 impl WsConnection {
-    async fn send_loop(mut write: WriteHalf<'_>, mut recv: mpsc::Receiver<RawMessage>) {
-        println!("send_loop");
+    async fn send_loop(mut write: WriteHalf<'_>, recv: &mut mpsc::Receiver<RawMessage>) {
+        // println!("send_loop");
         loop {
             match recv.recv().await {
                 Some(msg) => {
-                    println!("Proxying msg: {:?}", msg);
+                    // println!("Proxying msg: {:?}", msg);
                     crate::websocket_util::send_message(msg, &mut write).await;
                 },
                 None => {
-                    println!("Stopped");
+                    // println!("Stopped");
                     return;
                 }
             }
         }
     }
 
-    async fn receive_loop(mut read: ReadHalf<'_>, mut send: mpsc::Sender<RawMessage>) {
+    async fn receive_loop(mut read: ReadHalf<'_>, send: &mut mpsc::Sender<RawMessage>) {
         loop {
             match crate::websocket_util::receive_message(&mut read).await {
                 Ok(msg) => {
                     // if let MessageOpCode::TextFrame = msg.opcode {
-                        println!("Receive msg from proxy {:?}", msg);
+                    //     println!("Receive msg from proxy {:?}", msg);
                         send.send(msg).await;
                     // }
                 },
                 Err(e) => {
-                    println!("Error proxy receive_loop {}", e);
+                    // println!("Error proxy receive_loop {}", e);
                     return;
                 }
             }
@@ -66,10 +69,28 @@ impl WsConnection {
     }
 }
 
+// #[derive(Debug)]
 pub struct ProxyLocation {
     address: String,
     connections: Mutex<Vec<WsConnection>>
 }
+
+// impl Debug for ProxyLocation {
+//     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+//         struct Temp {
+//             connections: UnsafeCell<Vec<WsConnection>>
+//         }
+//         let mut uct = f.debug_struct("ProxyLocation");
+//         uct.field("address", &self.address);
+//         /// ABSOLUTELY UNSAFE!!!
+//         let v = unsafe {
+//             let cell = std::mem::transmute::<&Mutex<Vec<WsConnection>>, &Temp>(&self.connections);
+//             &*cell.connections.get()
+//         };
+//         uct.field("connections", v)
+//             .finish()
+//     }
+// }
 
 impl ProxyLocation {
     /// Returns TcpStream with completed handshake.
@@ -106,11 +127,10 @@ impl ProxyLocation {
             }
         }
         body.write_str("\r\n");
-        println!("{:#?}", data.headers);
-        println!("{}", String::from_utf8(body.bytes().to_vec()).unwrap());
+        // println!("{:#?}", data.headers);
+        // println!("{}", String::from_utf8(body.bytes().to_vec()).unwrap());
         let mut socket = TcpStream::connect(self.address.clone()).await.ok()?;
         socket.write_all(body.bytes()).await.unwrap();
-        socket.set_keepalive(Some(Duration::from_secs(20)));
         // println!("keepalive {:?}", socket.keepalive());
 
         let mut buff= [0u8; 2048];
@@ -118,7 +138,7 @@ impl ProxyLocation {
         let mut handshake = Vec::new();
         loop {
             let n = socket.read(&mut buff).await.ok()?;
-            println!("read {} bytes", n);
+            // println!("read {} bytes", n);
             handshake.extend_from_slice(&buff[0..n]);
             if handshake[n-2..n] == *b"\r\n" ||
                 prev_packet_ind != 0 && handshake[prev_packet_ind-1..prev_packet_ind+1] == *b"\r\n" {
@@ -140,41 +160,56 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, recv: Receiver<RawMessage>, send: Sender<RawMessage>) {
+    async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) {
         tokio::spawn(async move {
             let arr = self.locations.read().await;
             let loc_ind: usize = rand::thread_rng().gen_range(0, arr.len());
-            println!("Picked location #{}", loc_ind);
+            // println!("Picked location #{}", loc_ind);
             let loc = arr.get(loc_ind).unwrap();
             let mut socket = loc.get_raw_websocket(data.borrow()).await.unwrap();
             let (r, w) = socket.split();
-            println!("ProxyServer websocket_created");
-            let fut = abortable(async move {
+            // println!("ProxyServer websocket_created");
+            let (rx, tx) = oneshot::channel::<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>();
+            let (fut, handle) = abortable(async {
                 select! {
-                    _ = WsConnection::send_loop(w, recv) => {}
-                    _ = WsConnection::receive_loop(r, send) => {}
+                    _ = WsConnection::send_loop(w, &mut recv) => {}
+                    _ = WsConnection::receive_loop(r, &mut send) => {}
                 };
             });
             loc.connections.lock().await.push(WsConnection {
                 data: data.clone(),
-                abort_handle: fut.1
+                abort_handle: handle,
+                channels: tx
             });
             drop(arr);
-            fut.0.await;
-            println!("Proxy closed");
+
+            // drop(f1); drop(f2);
+            let v = fut.await;
+            if let Err(_) = v {
+                rx.send((recv, send));
+            }
+            // drop(fut);
             let mut arr = self.locations.read().await;
             if let Some(loc) = arr.get(loc_ind) {
                 let mut arr = loc.connections.lock().await;
                 arr.iter().position(|v| v.data.id == data.id)
                     .map(|v| arr.remove(v));
             }
-            println!("Ended");
+            println!("Proxy closed");
+            // println!("Ended");
         });
     }
 
     async fn websocket_closed(self: Arc<ProxyServer>, data: Arc<WebsocketData>) {
+        let mut arr = self.locations.read().await;
+        if let Some(loc) = arr.get(0) {
+            let mut arr = loc.connections.lock().await;
+            let mut ws_conn = arr.iter_mut().find(|v| v.data.id == data.id).unwrap();
+            let mut v = &mut ws_conn.channels;
+            let v = v.await;
+        }
         // TODO: implement
-        println!("websocket_closed");
+        // println!("websocket_closed");
         // unimplemented!();
         // let arr = self.connections.lock().await;
         // arr.iter().find(|v| v.data.id == data.id).map(|v| {
@@ -204,7 +239,7 @@ pub struct ProxyServerChannel {
 }
 
 impl ServerChannel for ProxyServerChannel {
-    fn websocket_created(&self, data: Arc<WebsocketData>, recv: Receiver<RawMessage>, send: Sender<RawMessage>) -> Pin<Box<dyn Future<Output=()> + Send>> {
+    fn websocket_created(&self, data: Arc<WebsocketData>, recv: mpsc::Receiver<RawMessage>, send: mpsc::Sender<RawMessage>) -> Pin<Box<dyn Future<Output=()> + Send>> {
         let s = self.server.clone();
         Box::pin(async move {
             s.websocket_created(data, recv, send).await;
