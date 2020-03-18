@@ -11,12 +11,10 @@ use std::mem::size_of;
 // use cpuprofiler::PROFILER;
 #[tokio::main]
 async fn main() {
-    println!("RawMessage {}", size_of::<RawMessage>());
-    println!("WebsocketData {}", size_of::<WebsocketData>());
     let ps = Arc::new(ProxyServer {
         // connections: Mutex::new(Vec::new()),
         // locations: Mutex::new(Vec::new())
-        locations: RwLock::new(Vec::new())
+        locations: RwLock::new(Vec::new()),
     });
     let pss = ps.clone();
 

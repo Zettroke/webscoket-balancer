@@ -94,7 +94,6 @@ pub struct ProxyLocation {
 impl ProxyLocation {
     /// Returns TcpStream with completed handshake.
     async fn get_raw_websocket(&self, data: &WebsocketData) -> Option<TcpStream> {
-        println!("get_raw_websocket start");
         let mut query_params: String = data.query_params.iter().map(|(k, v)| {
             k.clone() + "=" + v
         }).collect::<Vec<String>>().join("&");
@@ -174,7 +173,6 @@ impl ProxyLocation {
                 return None;
             }
         }
-        println!("get_raw_websocket end {:?}", self.address);
         // TODO: Handshake check!
         Some(socket)
     }
@@ -188,7 +186,7 @@ pub struct ProxyServer {
 
 impl ProxyServer {
     async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) {
-        tokio::spawn(async move {
+        let task = async move {
             let arr = self.locations.read().await;
             let loc_ind: usize = rand::thread_rng().gen_range(0, arr.len());
             // println!("Picked location #{}", loc_ind);
@@ -226,7 +224,9 @@ impl ProxyServer {
             }
             println!("Proxy closed");
             // println!("Ended");
-        });
+        };
+        // print_size(&task);
+        tokio::spawn(task);
     }
 
     async fn websocket_closed(self: Arc<ProxyServer>, data: Arc<WebsocketData>) {
@@ -281,4 +281,8 @@ impl ServerChannel for ProxyServerChannel {
             s.websocket_closed(data).await;
         })
     }
+}
+
+pub fn print_size<T>(t: &T) {
+    println!("{}", std::mem::size_of::<T>());
 }

@@ -15,6 +15,7 @@ use futures::future::{abortable, AbortHandle};
 use std::fmt::{Debug, Formatter};
 use bytes::{BufMut, Buf};
 use crate::ServerChannel;
+use crate::proxy::print_size;
 
 pub static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
 
@@ -148,7 +149,9 @@ pub struct WebsocketServerInner {
 
 impl WebsocketServerInner {
     async fn handler(self: Arc<WebsocketServerInner>, mut socket: TcpStream) {
-        let mut d = self.handshake(&mut socket).await.unwrap();
+        // let mut d: WebsocketData = Box::pin(self.handshake(&mut socket)).await.unwrap();
+        let mut d: WebsocketData = self.handshake(&mut socket).await.unwrap();
+
         d.id = rand::random();
         let data = Arc::new(d);
 
@@ -222,7 +225,7 @@ impl WebsocketServerInner {
 
     async fn receive_handshake_data(&self, socket: &mut TcpStream) -> Result<WebsocketData, HandshakeError> {
         let mut handshake: Vec<u8> = Vec::with_capacity(2048);
-        let mut buff = [0; 2048];
+        let mut buff = vec![0; 2048].into_boxed_slice();
         let mut prev_packet_ind: usize = 0;
         // handshake
         loop {
@@ -315,7 +318,9 @@ impl WebsocketServerInner {
             loop {
                 let (sock, _addr) = l.accept().await.unwrap();
                 // serv.channel.websocket_created()
-                tokio::spawn(WebsocketServerInner::handler(serv.clone(), sock));
+                let task  = WebsocketServerInner::handler(serv.clone(), sock);
+                // print_size(&task);
+                tokio::spawn(task);
             }
         });
         fut.await;
