@@ -75,6 +75,7 @@ pub struct RawMessage {
     pub payload: Vec<u8>
 }
 
+
 #[derive(Default)]
 pub struct WebsocketData {
     pub id: u128,
@@ -177,7 +178,7 @@ impl WebsocketServerInner {
             let mut arr = self.connections.write().await;
             arr.iter().position(|v| v.data.id == data.id).map(|v| arr.remove(v));
         }
-        self.channel.websocket_removed(data.clone()).await;
+        // self.channel.websocket_removed(data.clone()).await;
         // println!("closed");
         socket.shutdown(Shutdown::Both).unwrap();
     }
@@ -226,9 +227,32 @@ impl WebsocketServerInner {
         // handshake
         loop {
             let n = socket.read(&mut buff).await?;
+
             handshake.extend_from_slice(&buff[0..n]);
-            if handshake[n-2..n] == *b"\r\n" ||
-                prev_packet_ind != 0 && handshake[prev_packet_ind-1..prev_packet_ind+1] == *b"\r\n" {
+
+            let mut ind = if prev_packet_ind == 0 {
+                0
+            } else {
+                if prev_packet_ind > 3 { prev_packet_ind-3 } else { 0 }
+            };
+            let mut done = false;
+            loop {
+                match memchr::memchr(b'\r', &handshake[ind..handshake.len()]) {
+                    Some(ind_f) => {
+                        let v = ind + ind_f;
+                        if handshake.len() - v >= 4 {
+                            if handshake[v+1..v+4] == [b'\n', b'\r', b'\n'] {
+                                done = true;
+                                break;
+                            }
+                        }
+                        ind = v+1;
+                    },
+                    None => break
+                }
+            }
+
+            if done {
                 break;
             }
             prev_packet_ind += n;
@@ -236,6 +260,8 @@ impl WebsocketServerInner {
                 return Err(HandshakeError::SocketClosed);
             }
         }
+
+        // println!("handshake: {}", String::from_utf8(handshake.clone()).unwrap());
         let mut headers = [httparse::EMPTY_HEADER; 30];
 
         let mut req = httparse::Request::new(&mut headers);

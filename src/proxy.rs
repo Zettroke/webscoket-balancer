@@ -20,7 +20,6 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::borrow::Borrow;
 use tokio::net::tcp::{WriteHalf, ReadHalf};
 use tokio::sync::RwLock;
-use std::cell::UnsafeCell;
 
 // #[derive(Error)]
 // pub enum LocationWebsocketError {
@@ -71,8 +70,8 @@ impl WsConnection {
 
 // #[derive(Debug)]
 pub struct ProxyLocation {
-    address: String,
-    connections: Mutex<Vec<WsConnection>>
+    pub address: String,
+    pub connections: Mutex<Vec<WsConnection>>
 }
 
 // impl Debug for ProxyLocation {
@@ -95,7 +94,7 @@ pub struct ProxyLocation {
 impl ProxyLocation {
     /// Returns TcpStream with completed handshake.
     async fn get_raw_websocket(&self, data: &WebsocketData) -> Option<TcpStream> {
-
+        println!("get_raw_websocket start");
         let mut query_params: String = data.query_params.iter().map(|(k, v)| {
             k.clone() + "=" + v
         }).collect::<Vec<String>>().join("&");
@@ -119,7 +118,11 @@ impl ProxyLocation {
         body.write_str(" HTTP/1.1\r\n");
 
         for (k, v) in data.headers.iter() {
-            if k != "sec-websocket-extensions" {
+            if k == "host" {
+                body.write_str("host: ");
+                body.write_str(self.address.as_str());
+                body.write_str("\r\n");
+            } else if k != "sec-websocket-extensions" {
                 body.write_str(k);
                 body.write_str(": ");
                 body.write_str(v);
@@ -128,7 +131,7 @@ impl ProxyLocation {
         }
         body.write_str("\r\n");
         // println!("{:#?}", data.headers);
-        // println!("{}", String::from_utf8(body.bytes().to_vec()).unwrap());
+        // println!("body {}", String::from_utf8(body.bytes().to_vec()).unwrap());
         let mut socket = TcpStream::connect(self.address.clone()).await.ok()?;
         socket.write_all(body.bytes()).await.unwrap();
         // println!("keepalive {:?}", socket.keepalive());
@@ -138,10 +141,32 @@ impl ProxyLocation {
         let mut handshake = Vec::new();
         loop {
             let n = socket.read(&mut buff).await.ok()?;
-            // println!("read {} bytes", n);
+
             handshake.extend_from_slice(&buff[0..n]);
-            if handshake[n-2..n] == *b"\r\n" ||
-                prev_packet_ind != 0 && handshake[prev_packet_ind-1..prev_packet_ind+1] == *b"\r\n" {
+
+            let mut ind = if prev_packet_ind == 0 {
+                0
+            } else {
+                if prev_packet_ind > 3 { prev_packet_ind-3 } else { 0 }
+            };
+            let mut done = false;
+            loop {
+                match memchr::memchr(b'\r', &handshake[ind..handshake.len()]) {
+                    Some(ind_f) => {
+                        let v = ind + ind_f;
+                        if handshake.len() - v >= 4 {
+                            if handshake[v+1..v+4] == [b'\n', b'\r', b'\n'] {
+                                done = true;
+                                break;
+                            }
+                        }
+                        ind = v+1;
+                    },
+                    None => break
+                }
+            }
+
+            if done {
                 break;
             }
             prev_packet_ind += n;
@@ -149,6 +174,7 @@ impl ProxyLocation {
                 return None;
             }
         }
+        println!("get_raw_websocket end {:?}", self.address);
         // TODO: Handshake check!
         Some(socket)
     }
@@ -156,6 +182,7 @@ impl ProxyLocation {
 
 pub struct ProxyServer {
     pub locations: RwLock<Vec<ProxyLocation>>,
+    // pub locations: Mutex<Vec<ProxyLocation>>,
     // pub connections: Mutex<Vec<WsConnection>>
 }
 
@@ -166,7 +193,10 @@ impl ProxyServer {
             let loc_ind: usize = rand::thread_rng().gen_range(0, arr.len());
             // println!("Picked location #{}", loc_ind);
             let loc = arr.get(loc_ind).unwrap();
-            let mut socket = loc.get_raw_websocket(data.borrow()).await.unwrap();
+            let mut socket = match loc.get_raw_websocket(data.borrow()).await {
+                Some(s) => s,
+                None => return
+            };
             let (r, w) = socket.split();
             // println!("ProxyServer websocket_created");
             let (rx, tx) = oneshot::channel::<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>();
@@ -182,7 +212,6 @@ impl ProxyServer {
                 channels: tx
             });
             drop(arr);
-
             // drop(f1); drop(f2);
             let v = fut.await;
             if let Err(_) = v {
@@ -201,13 +230,13 @@ impl ProxyServer {
     }
 
     async fn websocket_closed(self: Arc<ProxyServer>, data: Arc<WebsocketData>) {
-        let mut arr = self.locations.read().await;
-        if let Some(loc) = arr.get(0) {
-            let mut arr = loc.connections.lock().await;
-            let mut ws_conn = arr.iter_mut().find(|v| v.data.id == data.id).unwrap();
-            let mut v = &mut ws_conn.channels;
-            let v = v.await;
-        }
+        // let mut arr = self.locations.read().await;
+        // if let Some(loc) = arr.get(0) {
+        //     let mut arr = loc.connections.lock().await;
+        //     let mut ws_conn = arr.iter_mut().find(|v| v.data.id == data.id).unwrap();
+        //     let mut v = &mut ws_conn.channels;
+        //     let v = v.await;
+        // }
         // TODO: implement
         // println!("websocket_closed");
         // unimplemented!();

@@ -1,18 +1,21 @@
 use webscoket_balancer::kappa;
-use webscoket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection};
+use webscoket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection, RawMessage, WebsocketData};
 use webscoket_balancer::proxy::ProxyServer;
 use tokio::sync::{Mutex, RwLock};
 use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
 use std::ops::Deref;
+use std::mem::size_of;
 
 // extern crate cpuprofiler;
 // use cpuprofiler::PROFILER;
 #[tokio::main]
 async fn main() {
-
+    println!("RawMessage {}", size_of::<RawMessage>());
+    println!("WebsocketData {}", size_of::<WebsocketData>());
     let ps = Arc::new(ProxyServer {
         // connections: Mutex::new(Vec::new()),
+        // locations: Mutex::new(Vec::new())
         locations: RwLock::new(Vec::new())
     });
     let pss = ps.clone();
@@ -51,10 +54,12 @@ async fn main() {
                     }
                 },
                 "proxies" => {
-                    // println!("proxies");
-                    // let v = pss.locations.read().await;
-                    // println!("dsadsadas");
-                    // println!("{:#?}", v.deref());
+                    println!("proxies:");
+                    let v = pss.locations.read().await;
+                    println!("got 1 lock");
+                    for pl in v.iter() {
+                        println!("{:?} got {} connections", pl.address, pl.connections.lock().await.len());
+                    }
                 },
                 "close" => {
                     if res.len() == 2 {
