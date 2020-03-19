@@ -131,7 +131,13 @@ impl ProxyLocation {
         body.write_str("\r\n");
         // println!("{:#?}", data.headers);
         // println!("body {}", String::from_utf8(body.bytes().to_vec()).unwrap());
-        let mut socket = TcpStream::connect(self.address.clone()).await.ok()?;
+        let mut socket = match TcpStream::connect(self.address.clone()).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("socket connect error: {}", e);
+                return None;
+            }
+        };
         socket.write_all(body.bytes()).await.unwrap();
         // println!("keepalive {:?}", socket.keepalive());
 
@@ -191,42 +197,50 @@ impl ProxyServer {
             let loc_ind: usize = rand::thread_rng().gen_range(0, arr.len());
             // println!("Picked location #{}", loc_ind);
             let loc = arr.get(loc_ind).unwrap();
-            let mut socket = match loc.get_raw_websocket(data.borrow()).await {
+            let mut socket = match Box::pin(loc.get_raw_websocket(data.borrow())).await {
                 Some(s) => s,
                 None => return
             };
-            let (r, w) = socket.split();
-            // println!("ProxyServer websocket_created");
-            let (rx, tx) = oneshot::channel::<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>();
-            let (fut, handle) = abortable(async {
-                select! {
-                    _ = WsConnection::send_loop(w, &mut recv) => {}
-                    _ = WsConnection::receive_loop(r, &mut send) => {}
-                };
-            });
+            drop(arr);
+            tokio::spawn(self.run_proxy_connection(loc_ind, data, socket, recv, send));
+        };
+        tokio::spawn(task);
+    }
+
+    async fn run_proxy_connection(self: Arc<ProxyServer>, loc_id: usize, data: Arc<WebsocketData>, mut socket: TcpStream, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) {
+        let (r, w) = socket.split();
+        let (rx, tx) = oneshot::channel::<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>();
+        let (fut, handle) = abortable(async {
+            select! {
+                _ = WsConnection::send_loop(w, &mut recv) => {}
+                _ = WsConnection::receive_loop(r, &mut send) => {}
+            };
+        });
+
+        if let Some(loc) = self.locations.read().await.get(loc_id) {
             loc.connections.lock().await.push(WsConnection {
                 data: data.clone(),
                 abort_handle: handle,
                 channels: tx
             });
-            drop(arr);
-            // drop(f1); drop(f2);
-            let v = fut.await;
-            if let Err(_) = v {
+        }
+
+        match fut.await {
+            Ok(_) => {
+                println!("Proxy closed");
+            },
+            Err(futures::future::Aborted) => {
+                println!("Aborted!!!");
                 rx.send((recv, send));
+
             }
-            // drop(fut);
-            let mut arr = self.locations.read().await;
-            if let Some(loc) = arr.get(loc_ind) {
-                let mut arr = loc.connections.lock().await;
-                arr.iter().position(|v| v.data.id == data.id)
-                    .map(|v| arr.remove(v));
-            }
-            println!("Proxy closed");
-            // println!("Ended");
-        };
-        // print_size(&task);
-        tokio::spawn(task);
+        }
+
+        if let Some(loc) = self.locations.read().await.get(loc_id) {
+            let mut arr = loc.connections.lock().await;
+            arr.iter().position(|v| v.data.id == data.id)
+                .map(|v| arr.remove(v));
+        }
     }
 
     async fn websocket_closed(self: Arc<ProxyServer>, data: Arc<WebsocketData>) {
@@ -245,6 +259,34 @@ impl ProxyServer {
         //     v.abort_handle.abort();
         //     // arr.remove(ind)
         // });
+    }
+
+    pub async fn move_connection(self: Arc<ProxyServer>, id: u128, loc_ind: usize) {
+        let mut res = None;
+        'outer: for v1 in self.locations.read().await.iter() {
+            for conn in v1.connections.lock().await.iter_mut() {
+                if conn.data.id == id {
+                    conn.abort_handle.abort();
+                    let data = conn.data.clone();
+                    let channels = match (&mut conn.channels).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            println!("{}", e);
+                            return;
+                        }
+                    };
+                    res = Some((data, channels));
+                    break 'outer;
+                }
+            }
+        }
+
+        if let Some((data, channels)) = res {
+            if let Some(loc) = self.locations.read().await.get(loc_ind) {
+                let mut socket = loc.get_raw_websocket(&data).await.unwrap();
+                tokio::spawn(self.clone().run_proxy_connection(loc_ind, data, socket, channels.0, channels.1));
+            }
+        }
     }
 
     pub fn get_channel(self: Arc<ProxyServer>) -> Box<ProxyServerChannel> {

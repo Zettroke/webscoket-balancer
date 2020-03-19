@@ -53,10 +53,18 @@ async fn main() {
                 },
                 "proxies" => {
                     println!("proxies:");
-                    let v = pss.locations.read().await;
+                    let v = (&pss).locations.read().await;
                     println!("got 1 lock");
                     for pl in v.iter() {
                         println!("{:?} got {} connections", pl.address, pl.connections.lock().await.len());
+                    }
+                },
+                "proxy" => {
+                    if res.get(1) == Some(&"move") {
+                        let conn_id = u128::from_str_radix(res[2], 16).unwrap();
+                        let to_id = res[3].parse::<usize>().unwrap();
+
+                        pss.clone().move_connection(conn_id, to_id).await;
                     }
                 },
                 "close" => {
