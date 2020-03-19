@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use thiserror::Error;
 use httparse::{Request, Header, Response};
 use std::fmt::{Write, Debug, Formatter, Pointer};
-use bytes::Buf;
+use bytes::{Buf, BufMut};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::borrow::Borrow;
 use tokio::net::tcp::{WriteHalf, ReadHalf};
@@ -105,35 +105,35 @@ impl ProxyLocation {
         let path = data.path.to_owned() + "?" + query_params.as_str();
 
         let mut body = bytes::BytesMut::new();
-        body.write_str("GET ");
+        body.put_slice(b"GET ");
 
-        body.write_str(data.path.as_str());
+        body.put_slice(data.path.as_bytes());
         if data.query_params.len() > 0 {
-            body.write_char('?');
+            body.put_u8(b'?');
             for (ind, (k, v)) in data.query_params.iter().enumerate() {
-                body.write_str(k);
-                body.write_char('=');
-                body.write_str(v);
+                body.put_slice(k.as_bytes());
+                body.put_u8(b'=');
+                body.put_slice(v.as_bytes());
                 if ind != data.query_params.len() - 1 {
-                    body.write_char('?');
+                    body.put_u8(b'&');
                 }
             }
         }
-        body.write_str(" HTTP/1.1\r\n");
+        body.put_slice(b" HTTP/1.1\r\n");
 
         for (k, v) in data.headers.iter() {
             if k == "host" {
-                body.write_str("host: ");
-                body.write_str(self.address.as_str());
-                body.write_str("\r\n");
+                body.put_slice(b"host: ");
+                body.put_slice(self.address.as_bytes());
+                body.put_slice(b"\r\n");
             } else if k != "sec-websocket-extensions" {
-                body.write_str(k);
-                body.write_str(": ");
-                body.write_str(v);
-                body.write_str("\r\n");
+                body.put_slice(k.as_bytes());
+                body.put_slice(b": ");
+                body.put_slice(v.as_bytes());
+                body.put_slice(b"\r\n");
             }
         }
-        body.write_str("\r\n");
+        body.put_slice(b"\r\n");
         // println!("{:#?}", data.headers);
         // println!("body {}", String::from_utf8(body.bytes().to_vec()).unwrap());
         let mut socket = match TcpStream::connect(self.address.clone()).await {
