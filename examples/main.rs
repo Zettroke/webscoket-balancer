@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
 use std::ops::Deref;
 use std::mem::size_of;
+use std::collections::HashMap;
 
 // extern crate cpuprofiler;
 // use cpuprofiler::PROFILER;
@@ -14,6 +15,8 @@ async fn main() {
     let ps = Arc::new(ProxyServer {
         // connections: Mutex::new(Vec::new()),
         // locations: Mutex::new(Vec::new())
+        distribution: dashmap::DashMap::new(),
+        pending_moves: Mutex::new(HashMap::new()),
         locations: RwLock::new(Vec::new()),
     });
     let pss = ps.clone();

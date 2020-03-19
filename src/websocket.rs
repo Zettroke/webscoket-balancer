@@ -76,12 +76,23 @@ pub struct RawMessage {
     pub payload: Vec<u8>
 }
 
+impl RawMessage {
+    pub fn unmask(&mut self) {
+        if self.mask {
+            for (ind, v) in self.payload.iter_mut().enumerate() {
+                *v = *v ^ self.mask_key[ind % 4];
+            }
+        }
+    }
+}
+
 
 #[derive(Default)]
 pub struct WebsocketData {
     pub id: u128,
     pub path: String,
     /// Header name(key) is lowercase
+    pub distributed_id: String,
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>
 }
