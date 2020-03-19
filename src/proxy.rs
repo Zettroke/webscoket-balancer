@@ -136,7 +136,13 @@ impl ProxyLocation {
         body.write_str("\r\n");
         // println!("{:#?}", data.headers);
         // println!("body {}", String::from_utf8(body.bytes().to_vec()).unwrap());
-        let mut socket = TcpStream::connect(self.address.clone()).await.ok()?;
+        let mut socket = match TcpStream::connect(self.address.clone()).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("socket connect error: {}", e);
+                return None;
+            }
+        };
         socket.write_all(body.bytes()).await.unwrap();
         // println!("keepalive {:?}", socket.keepalive());
 
@@ -242,7 +248,7 @@ impl ProxyServer {
             let loc_ind: usize = rand::thread_rng().gen_range(0, arr.len());
             // println!("Picked location #{}", loc_ind);
             let loc = arr.get(loc_ind).unwrap();
-            let mut socket = match loc.get_raw_websocket(data.borrow()).await {
+            let mut socket = match Box::pin(loc.get_raw_websocket(data.borrow())).await {
                 Some(s) => s,
                 None => return
             };

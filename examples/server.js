@@ -7,7 +7,9 @@ var cnt = 0
 wss1.on('connection', function connection(ws) {
     console.log('1338 - connected', cnt++);
     ws.on('message', function incoming(message) {
-        ws.send('1338' + message);
+        let s = '1338: ' + message;
+        console.log(s);
+        ws.send(s);
     });
 
     ws.send('something');
@@ -19,7 +21,9 @@ wss2.on('connection', function connection(ws) {
 	
     console.log('1339 - connected', cnt++);
     ws.on('message', function incoming(message) {
-        ws.send('1339' + message);
+        let s = '1339: ' + message;
+        console.log(s);
+        ws.send(s);
     });
 
     ws.send('something');
