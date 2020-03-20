@@ -1,11 +1,9 @@
 use webscoket_balancer::kappa;
-use webscoket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection, RawMessage, WebsocketData};
+use webscoket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection};
 use webscoket_balancer::proxy::ProxyServer;
 use tokio::sync::{Mutex, RwLock};
 use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
-use std::ops::Deref;
-use std::mem::size_of;
 use std::collections::HashMap;
 
 // extern crate cpuprofiler;
@@ -64,10 +62,8 @@ async fn main() {
                 },
                 "proxy" => {
                     if res.get(1) == Some(&"move") {
-                        let conn_id = u128::from_str_radix(res[2], 16).unwrap();
-                        let to_id = res[3].parse::<usize>().unwrap();
-
-                        pss.clone().move_connection(conn_id, to_id).await;
+                        let d_id = res[2];
+                        pss.clone().move_distribution(d_id.to_string()).await;
                     }
                 },
                 "close" => {

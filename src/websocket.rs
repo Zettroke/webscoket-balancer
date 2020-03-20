@@ -1,7 +1,7 @@
 extern crate memchr;
 use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, Ipv4Addr, Shutdown};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use std::collections::HashMap;
 use memchr::memchr;
@@ -9,13 +9,11 @@ use crypto::sha1::Sha1;
 use crypto::digest::Digest;
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::{mpsc, Mutex, RwLock, RwLockReadGuard};
+use tokio::sync::{mpsc, RwLock, RwLockReadGuard};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use futures::future::{abortable, AbortHandle};
 use std::fmt::{Debug, Formatter};
-use bytes::{BufMut, Buf};
 use crate::ServerChannel;
-use crate::proxy::print_size;
 
 pub static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
 
@@ -101,6 +99,7 @@ impl Debug for WebsocketData {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("")
             .field("id", &format!("{:X}", self.id))
+            .field("distributed_id", &self.distributed_id)
             .field("path", &self.path)
             .field("headers", &self.headers)
             .field("query_params", &self.query_params);
@@ -142,7 +141,7 @@ impl WebsocketConnection {
     async fn send_loop(_data: Arc<WebsocketData>, mut write_half: WriteHalf<'_>, mut source: mpsc::Receiver<RawMessage>) {
         loop {
             let v = source.recv().await;
-            if let Some(mut msg) = v {
+            if let Some(msg) = v {
                 crate::websocket_util::send_message(msg, &mut write_half).await;
             } else {
                 return;
@@ -187,7 +186,7 @@ impl WebsocketServerInner {
             };
             self.connections.write().await.push(conn);
             // join!(recv_fut, send_fut);
-            fut.await;
+            let _ = fut.await;
             // println!("Kappa!");
             let mut arr = self.connections.write().await;
             arr.iter().position(|v| v.data.id == data.id).map(|v| arr.remove(v));
@@ -317,14 +316,14 @@ impl WebsocketServerInner {
             let v = String::from_utf8(h.value.to_vec()).map_err(|_| HandshakeError::BadRequest)?;
             res.headers.insert(h.name.to_lowercase(), v);
         }
-
+        res.distributed_id = res.query_params.get("room_id").unwrap().to_string();
         Ok(res)
     }
 
     pub async fn run(self: Arc<WebsocketServerInner>) {
         let serv = self.clone();
 
-        let (fut, handle) = abortable(async move {
+        let (fut, _handle) = abortable(async move {
             let mut l = TcpListener::bind(serv.addr).await.unwrap();
             loop {
                 let (sock, _addr) = l.accept().await.unwrap();

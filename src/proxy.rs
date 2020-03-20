@@ -4,24 +4,19 @@ use futures::Future;
 use crate::websocket::{RawMessage, WebsocketData, MessageOpCode};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use futures::future::AbortHandle;
 use tokio::time::{delay_for, Duration};
 use futures::future::abortable;
 use tokio::select;
 use std::pin::Pin;
-use rand::Rng;
 use tokio::net::TcpStream;
-use thiserror::Error;
-use httparse::{Request, Header, Response};
-use std::fmt::{Write, Debug, Formatter, Pointer};
+use std::fmt::Debug;
 use bytes::{Buf, BufMut};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::borrow::Borrow;
 use tokio::net::tcp::{WriteHalf, ReadHalf};
 use tokio::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::ptr::null;
 use std::ops::Deref;
 use std::collections::HashMap;
 
@@ -35,17 +30,19 @@ pub struct WsConnection {
     distribution_id: String,
     data: Arc<WebsocketData>,
     abort_handle: AbortHandle,
-    channels: oneshot::Receiver<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>
+    // channels: oneshot::Receiver<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>
+    client_sender: mpsc::Sender<RawMessage>
 }
 
 impl WsConnection {
-    async fn send_loop(mut write: WriteHalf<'_>, recv: &mut mpsc::Receiver<RawMessage>) {
+    async fn send_loop<T: MessageListener>(mut write: WriteHalf<'_>, recv: &mut mpsc::Receiver<RawMessage>, client_msg_handler: T) {
         // println!("send_loop");
         loop {
             match recv.recv().await {
                 Some(msg) => {
-                    // println!("Proxying msg: {:?}", msg);
-                    crate::websocket_util::send_message(msg, &mut write).await;
+                    if let Some(msg) = client_msg_handler.handle(msg) {
+                        crate::websocket_util::send_message(msg, &mut write).await;
+                    }
                 },
                 None => {
                     // println!("Stopped");
@@ -64,7 +61,7 @@ impl WsConnection {
                         send.send(msg).await;
                     // }
                 },
-                Err(e) => {
+                Err(_e) => {
                     // println!("Error proxy receive_loop {}", e);
                     return;
                 }
@@ -76,7 +73,8 @@ impl WsConnection {
 // #[derive(Debug)]
 pub struct ProxyLocation {
     pub address: String,
-    pub connections: Mutex<Vec<WsConnection>>
+    pub connections: Mutex<Vec<WsConnection>>,
+    pub connections_count: AtomicU32
 }
 
 // impl Debug for ProxyLocation {
@@ -99,11 +97,6 @@ pub struct ProxyLocation {
 impl ProxyLocation {
     /// Returns TcpStream with completed handshake.
     async fn get_raw_websocket(&self, data: &WebsocketData) -> Option<TcpStream> {
-        let mut query_params: String = data.query_params.iter().map(|(k, v)| {
-            k.clone() + "=" + v
-        }).collect::<Vec<String>>().join("&");
-        let path = data.path.to_owned() + "?" + query_params.as_str();
-
         let mut body = bytes::BytesMut::new();
         body.put_slice(b"GET ");
 
@@ -215,10 +208,11 @@ struct ControlMessageListener {
 
 impl MessageListener for ControlMessageListener {
     fn handle(&self, mut msg: RawMessage) -> Option<RawMessage> {
-        let v = b"WSPROXY_RECONN";
+        let v = b"WSPROXY_RECONNECTED";
         if msg.payload.len() == v.len() {
             msg.unmask();
             if msg.payload.as_slice() == v {
+                println!("receive control message WSPROXY_RECONNECTED");
                 let server = self.server.clone();
                 let data = self.data.clone();
                 tokio::spawn(async move {
@@ -244,42 +238,42 @@ impl MessageListener for ControlMessageListener {
 impl ProxyServer {
     async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) {
         let task = async move {
-            let arr = self.locations.read().await;
-            let loc_ind: usize = rand::thread_rng().gen_range(0, arr.len());
-            // println!("Picked location #{}", loc_ind);
-            let loc = arr.get(loc_ind).unwrap();
+
+            let loc = self.get_location(data.distributed_id.clone()).await;
+
             let mut socket = match Box::pin(loc.get_raw_websocket(data.borrow())).await {
                 Some(s) => s,
                 None => return
             };
             let (r, w) = socket.split();
             // println!("ProxyServer websocket_created");
-            let (rx, tx) = oneshot::channel::<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>();
+            let cml = ControlMessageListener {
+                data: data.clone(),
+                server: self.clone()
+            };
+            let send_clone = send.clone();
             let (fut, handle) = abortable(async {
                 select! {
-                    _ = WsConnection::send_loop(w, &mut recv) => {}
+                    _ = WsConnection::send_loop(w, &mut recv, cml) => {}
                     _ = WsConnection::receive_loop(r, &mut send) => {}
                 };
             });
             loc.connections.lock().await.push(WsConnection {
                 data: data.clone(),
                 abort_handle: handle,
-                channels: tx,
-                distribution_id: data.query_params.values().next().unwrap().to_string()
+                distribution_id: data.query_params.values().next().unwrap().to_string(),
+                client_sender: send_clone
             });
-            drop(arr);
-            // drop(f1); drop(f2);
-            let v = fut.await;
-            if let Err(_) = v {
-                rx.send((recv, send));
-            }
-            // drop(fut);
-            let mut arr = self.locations.read().await;
-            if let Some(loc) = arr.get(loc_ind) {
-                let mut arr = loc.connections.lock().await;
-                arr.iter().position(|v| v.data.id == data.id)
-                    .map(|v| arr.remove(v));
-            }
+            loc.connections_count.fetch_add(1, Ordering::Relaxed);
+            let _ = fut.await;
+
+            // if let Some(loc)self.distribution.get(&data.distributed_id)
+            // let mut arr = self.locations.read().await;
+            // if let Some(loc) = arr.get(loc_ind) {
+            let mut arr = loc.connections.lock().await;
+            arr.iter().position(|v| v.data.id == data.id)
+                .map(|v| arr.remove(v));
+            loc.connections_count.store(arr.len() as u32, Ordering::Relaxed);
             println!("Proxy closed");
             // println!("Ended");
         };
@@ -287,7 +281,7 @@ impl ProxyServer {
         tokio::spawn(task);
     }
 
-    async fn websocket_closed(self: Arc<ProxyServer>, data: Arc<WebsocketData>) {
+    async fn websocket_closed(self: Arc<ProxyServer>, _data: Arc<WebsocketData>) {
         // let mut arr = self.locations.read().await;
         // if let Some(loc) = arr.get(0) {
         //     let mut arr = loc.connections.lock().await;
@@ -313,18 +307,22 @@ impl ProxyServer {
     }
 
     fn pick_new_location(locations: &Vec<Arc<ProxyLocation>>) -> Arc<ProxyLocation>{
-        let ind = rand::thread_rng().gen_range(0, locations.len());
-        return locations.get(ind).unwrap().clone();
+        locations.iter()
+            .min_by_key(|v| v.connections_count.load(Ordering::Relaxed))
+            .unwrap().clone()
+        // let ind = rand::thread_rng().gen_range(0, locations.len());
+        // return locations.get(ind).unwrap().clone();
     }
 
-    async fn move_distribution(self: Arc<ProxyServer>, distribution_id: String) {
+    pub async fn move_distribution(self: Arc<ProxyServer>, distribution_id: String) {
         let new_loc = ProxyServer::pick_new_location(self.locations.read().await.deref());
-        self.move_distribution_to(distribution_id, new_loc);
+        println!("Distributing to {}", new_loc.address);
+        self.move_distribution_to(distribution_id, new_loc).await;
     }
-    async fn move_distribution_to(self: Arc<ProxyServer>, distribution_id: String, loc: Arc<ProxyLocation>) {
+    pub async fn move_distribution_to(self: Arc<ProxyServer>, distribution_id: String, loc: Arc<ProxyLocation>) {
         /// rewrite distribution map, so all new connections will end up in new location
         let mut pending_map = self.pending_moves.lock().await;
-        if pending_map.contains_key(&distribution_id) {
+        if pending_map.contains_key(&distribution_id) || !self.distribution.contains_key(&distribution_id) {
             return;
         }
         let mut old_loc = loc.clone();
@@ -335,19 +333,34 @@ impl ProxyServer {
         let mut moving_connections = vec![];
 
         let mut conns = old_loc.connections.lock().await;
-        for i in 0..conns.len() {
+        let mut i = 0;
+        while i < conns.len() {
             if conns[i].distribution_id == distribution_id {
                 moving_connections.push(conns.remove(i));
+            } else {
+                i += 1
             }
         }
+        old_loc.connections_count.store(conns.len() as u32, Ordering::Relaxed);
         drop(conns);
 
         let proxy_server = self.clone();
         let d_id = distribution_id.clone();
         let (fut, handle) = abortable(async move {
             delay_for(Duration::from_secs(30)).await;
+            println!("timeout for distribution id {}", d_id);
             proxy_server.pending_done(&d_id).await;
         });
+        for conn in moving_connections.iter_mut() {
+            conn.client_sender.send(RawMessage {
+                fin: true,
+                opcode: MessageOpCode::TextFrame,
+                mask: false,
+                mask_key: [0u8; 4],
+                payload: b"WSPROXY_DISCONNECTED".to_vec()
+            }).await;
+        }
+
         let pm = PendingMove {
             pending_count: AtomicU32::new(moving_connections.len() as u32),
             old_connections: moving_connections,
@@ -357,14 +370,13 @@ impl ProxyServer {
         drop(pending_map);
 
         tokio::spawn(fut);
-
-
     }
 
     async fn pending_done(&self, distribution_id: &str) {
         if let Some(pm) = self.pending_moves.lock().await.remove(distribution_id) {
             pm.pending_count.store(0, Ordering::Relaxed);
-            pm.old_connections.iter().for_each(|c|c.abort_handle.abort())
+            pm.old_connections.iter().for_each(|c|c.abort_handle.abort());
+            pm.timeout_abort.abort();
         }
     }
 
@@ -377,7 +389,8 @@ impl ProxyServer {
     pub async fn add_location(&self, addr: String) {
         self.locations.write().await.push(Arc::new(ProxyLocation {
             address: addr,
-            connections: Mutex::new(Vec::new())
+            connections: Mutex::new(Vec::new()),
+            connections_count: AtomicU32::new(0)
         }))
     }
 
@@ -404,6 +417,6 @@ impl ServerChannel for ProxyServerChannel {
     }
 }
 
-pub fn print_size<T>(t: &T) {
+pub fn print_size<T>(_: &T) {
     println!("{}", std::mem::size_of::<T>());
 }
