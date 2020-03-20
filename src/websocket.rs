@@ -333,7 +333,7 @@ impl WebsocketServerInner {
                 tokio::spawn(task);
             }
         });
-        fut.await;
+        let _ = fut.await;
 
     }
 

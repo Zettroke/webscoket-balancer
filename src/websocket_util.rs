@@ -1,6 +1,5 @@
 use crate::websocket::{RawMessage, MAX_MESSAGE_SIZE, MessageOpCode};
-use tokio::io::{BufWriter, AsyncWriteExt, BufReader, AsyncReadExt, AsyncRead, AsyncWrite};
-use tokio::net::tcp::{ WriteHalf, ReadHalf };
+use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncWrite};
 use bytes::{BufMut, Buf};
 use thiserror::Error;
 
@@ -59,7 +58,7 @@ pub async fn receive_message<T: AsyncReadExt + Unpin>(reader: &mut T) -> Result<
     });
 }
 
-pub async fn send_message<T: AsyncWrite + Unpin>(mut msg: RawMessage, writer: &mut T) {
+pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T) {
     let mut out = bytes::BytesMut::new();
     out.put_u8((msg.fin as u8) << 7 | (msg.opcode as u8));
 

@@ -58,7 +58,10 @@ impl WsConnection {
                 Ok(msg) => {
                     // if let MessageOpCode::TextFrame = msg.opcode {
                     //     println!("Receive msg from proxy {:?}", msg);
-                        send.send(msg).await;
+                    match send.send(msg).await {
+                        Err(_) => return,
+                        _ => {}
+                    }
                     // }
                 },
                 Err(_e) => {
@@ -320,7 +323,7 @@ impl ProxyServer {
         self.move_distribution_to(distribution_id, new_loc).await;
     }
     pub async fn move_distribution_to(self: Arc<ProxyServer>, distribution_id: String, loc: Arc<ProxyLocation>) {
-        /// rewrite distribution map, so all new connections will end up in new location
+        // rewrite distribution map, so all new connections will end up in new location
         let mut pending_map = self.pending_moves.lock().await;
         if pending_map.contains_key(&distribution_id) || !self.distribution.contains_key(&distribution_id) {
             return;
@@ -358,7 +361,7 @@ impl ProxyServer {
                 mask: false,
                 mask_key: [0u8; 4],
                 payload: b"WSPROXY_DISCONNECTED".to_vec()
-            }).await;
+            }).await.unwrap();
         }
 
         let pm = PendingMove {
