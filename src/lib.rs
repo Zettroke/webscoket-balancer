@@ -7,6 +7,7 @@ use std::pin::Pin;
 pub mod websocket;
 pub mod proxy;
 pub mod websocket_util;
+pub mod location_manager;
 pub fn kappa() -> u64 {
     1337*1488
 }

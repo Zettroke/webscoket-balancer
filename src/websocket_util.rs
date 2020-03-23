@@ -46,8 +46,9 @@ pub async fn receive_message<T: AsyncReadExt + Unpin>(reader: &mut T) -> Result<
     }
 
     let mut payload_buff = vec![0u8; payload_len as usize];
-
-    reader.read(payload_buff.as_mut_slice()).await?;
+    if payload_len != 0 {
+        reader.read(payload_buff.as_mut_slice()).await?;
+    }
 
     return Ok(RawMessage {
         fin,
@@ -74,9 +75,6 @@ pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T
     }
 
     if msg.mask {
-        // for (ind, v) in msg.payload.iter_mut().enumerate() {
-        //     *v = *v ^ msg.mask_key[ind % 4];
-        // }
         out.put_slice(&msg.mask_key);
     }
     out.put(msg.payload.as_slice());

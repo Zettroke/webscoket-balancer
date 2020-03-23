@@ -1,26 +1,25 @@
 use webscoket_balancer::kappa;
 use webscoket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection};
 use webscoket_balancer::proxy::ProxyServer;
-use tokio::sync::{Mutex, RwLock};
 use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
-use std::collections::HashMap;
+use webscoket_balancer::location_manager::LocationManager;
+use std::sync::atomic::Ordering;
 
 // extern crate cpuprofiler;
 // use cpuprofiler::PROFILER;
 #[tokio::main]
 async fn main() {
-    let ps = Arc::new(ProxyServer {
-        // connections: Mutex::new(Vec::new()),
-        // locations: Mutex::new(Vec::new())
-        distribution: dashmap::DashMap::new(),
-        pending_moves: Mutex::new(HashMap::new()),
-        locations: RwLock::new(Vec::new()),
-    });
-    let pss = ps.clone();
+    let lm = Arc::new(LocationManager::new());
+    lm.add_location("127.0.0.1:1338".to_string()).await;
+    lm.add_location("127.0.0.1:1339".to_string()).await;
+    let lmm = lm.clone();
 
-    ps.add_location("127.0.0.1:1338".to_string()).await;
-    ps.add_location("127.0.0.1:1339".to_string()).await;
+    let ps = ProxyServer::new(lm.clone());
+    let _pss = ps.clone();
+
+    // ps.add_location("127.0.0.1:1338".to_string()).await;
+    // ps.add_location("127.0.0.1:1339".to_string()).await;
 // Code you want to sample goes here!
 
     let s = WebsocketServerBuilder::new()
@@ -35,7 +34,7 @@ async fn main() {
             reader.read_line(&mut v).await.unwrap();
             v.remove(v.len()-1);
             let res: Vec<&str> = v.split(' ').collect();
-            // println!("Red \"{}\" line!", v);
+
             match res[0] {
                 "p" => {
                     let arr = s.get_connections().await;
@@ -54,16 +53,16 @@ async fn main() {
                 },
                 "proxies" => {
                     println!("proxies:");
-                    let v = (&pss).locations.read().await;
+                    let v = lmm.locations.read().await;
                     println!("got 1 lock");
                     for pl in v.iter() {
-                        println!("{:?} got {} connections", pl.address, pl.connections.lock().await.len());
+                        println!("{:?} got {} connections", pl.address, pl.connection_count.load(Ordering::Relaxed));
                     }
                 },
                 "proxy" => {
                     if res.get(1) == Some(&"move") {
-                        let d_id = res[2];
-                        pss.clone().move_distribution(d_id.to_string()).await;
+                        let d_id = res[2].to_string();
+                        lmm.move_distribution(d_id).await;
                     }
                 },
                 "close" => {
