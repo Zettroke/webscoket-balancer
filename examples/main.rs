@@ -6,10 +6,9 @@ use tokio::io::{BufReader, AsyncBufReadExt};
 use webscoket_balancer::location_manager::LocationManager;
 use std::sync::atomic::Ordering;
 
-// extern crate cpuprofiler;
-// use cpuprofiler::PROFILER;
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let lm = Arc::new(LocationManager::new());
     lm.add_location("127.0.0.1:1338".to_string()).await;
     lm.add_location("127.0.0.1:1339".to_string()).await;

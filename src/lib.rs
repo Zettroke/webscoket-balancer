@@ -3,6 +3,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use futures::Future;
 use std::pin::Pin;
+#[macro_use] extern crate log;
+
 
 pub mod websocket;
 pub mod proxy;

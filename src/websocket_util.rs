@@ -26,8 +26,6 @@ pub async fn receive_message<T: AsyncReadExt + Unpin>(reader: &mut T) -> Result<
 
     let short_payload_len = (v & 0b0111_1111) as u8;
 
-    // println!("fin: {}, opcode: {:?} - {}, short_payload_len: {}", fin, opcode, opcode_v as u8, short_payload_len);
-
     let payload_len = match short_payload_len {
         126 => {
             reader.read_u16().await? as u64
@@ -61,7 +59,7 @@ pub async fn receive_message<T: AsyncReadExt + Unpin>(reader: &mut T) -> Result<
 
 pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T) {
     let mut out = bytes::BytesMut::new();
-    out.put_u8((msg.fin as u8) << 7 | (msg.opcode as u8));
+    out.put_u8(((msg.fin as u8) << 7) | (msg.opcode as u8));
 
     let mask_v = (msg.mask as u8) << 7;
     if msg.payload.len() <= 125 {
@@ -73,10 +71,9 @@ pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T
         out.put_u8(mask_v | 127);
         out.put_u64(msg.payload.len() as u64);
     }
-
     if msg.mask {
         out.put_slice(&msg.mask_key);
     }
-    out.put(msg.payload.as_slice());
+    out.put_slice(msg.payload.as_slice());
     writer.write(out.bytes()).await.unwrap();
 }

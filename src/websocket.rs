@@ -33,7 +33,7 @@ enum HandshakeError {
     IOError(#[from] std::io::Error),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum MessageOpCode {
     ContinuationFrame = 0,
     TextFrame = 1,
@@ -81,7 +81,7 @@ impl RawMessage {
 pub struct WebsocketData {
     pub id: u128,
     pub path: String,
-    pub distributed_id: String,
+    pub distribution_id: String,
     /// Header name(key) is lowercase
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>
@@ -91,10 +91,11 @@ impl Debug for WebsocketData {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("")
             .field("id", &format!("{:X}", self.id))
-            .field("distributed_id", &self.distributed_id)
+            .field("distribution_id", &self.distribution_id)
             .field("path", &self.path)
-            .field("headers", &self.headers)
-            .field("query_params", &self.query_params);
+            .finish();
+            // .field("headers", &self.headers)
+            // .field("query_params", &self.query_params);
 
         return Ok(())
     }
@@ -208,14 +209,22 @@ impl WebsocketServerInner {
         hasher.result(&mut output);
         let resp_key = base64::encode(output);
 
-        socket.write(
-            format!("\
+        socket.write(b"\
             HTTP/1.1 101 Switching Protocols\r\n\
             Upgrade: websocket\r\n\
             Connection: Upgrade\r\n\
-            Sec-WebSocket-Accept: {}\r\n\
-            \r\n", resp_key).as_bytes()
+        ").await;
+
+        socket.write(
+            format!("Sec-WebSocket-Accept: {}\r\n", resp_key).as_bytes()
         ).await?;
+        if let Some(protocol) = data.headers.get("sec-websocket-protocol") {
+            socket.write(
+                format!("Sec-WebSocket-Protocol: {}\r\n", protocol).as_bytes()
+            ).await?;
+        }
+
+        socket.write(b"\r\n").await?;
 
         Ok(data)
     }
@@ -300,7 +309,7 @@ impl WebsocketServerInner {
             let v = String::from_utf8(h.value.to_vec()).map_err(|_| HandshakeError::BadRequest)?;
             res.headers.insert(h.name.to_lowercase(), v);
         }
-        res.distributed_id = res.query_params.get("room_id").unwrap().to_string();
+        res.distribution_id = res.query_params.get("roomId").unwrap().to_string();
         Ok(res)
     }
 

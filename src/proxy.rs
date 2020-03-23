@@ -9,7 +9,7 @@ use tokio::time::{delay_for, Duration};
 use futures::future::abortable;
 use tokio::select;
 use std::pin::Pin;
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter, Error};
 use std::borrow::Borrow;
 use tokio::net::tcp::{WriteHalf, ReadHalf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,19 +17,26 @@ use std::collections::HashMap;
 use crate::location_manager::{LocationManager, SocketWrapper, LocationManagerMessage};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry::Occupied;
+use std::ops::Deref;
 
 // #[derive(Error)]
 // pub enum LocationWebsocketError {
 //
 // }
 
-#[derive(Debug)]
 pub struct WsConnection {
-    distribution_id: String,
     data: Arc<WebsocketData>,
     abort_handle: AbortHandle,
     // channels: oneshot::Receiver<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>
     client_sender: mpsc::Sender<RawMessage>
+}
+
+impl Debug for WsConnection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsConnection")
+            .field("data", self.data.deref())
+            .finish()
+    }
 }
 
 impl WsConnection {
@@ -53,18 +60,19 @@ impl WsConnection {
 
     async fn receive_loop(mut read: ReadHalf<'_>, send: &mut mpsc::Sender<RawMessage>) {
         loop {
+            // println!("proxy re")
             match crate::websocket_util::receive_message(&mut read).await {
                 Ok(msg) => {
                     // if let MessageOpCode::TextFrame = msg.opcode {
-                    //     println!("Receive msg from proxy {:?}", msg);
+                    // println!("Receive msg from proxy {:?}", msg);
                     match send.send(msg).await {
                         Err(_) => return,
                         _ => {}
                     }
                     // }
                 },
-                Err(_e) => {
-                    // println!("Error proxy receive_loop {}", e);
+                Err(e) => {
+                    println!("Error proxy receive_loop {}", e);
                     return;
                 }
             }
@@ -74,7 +82,7 @@ impl WsConnection {
 
 pub struct PendingMove {
     old_connections: Vec<WsConnection>,
-    pending_count: AtomicU32,
+    pending_count: u32,
     timeout_abort: AbortHandle
 }
 
@@ -99,18 +107,19 @@ impl MessageListener for ControlMessageListener {
         if msg.payload.len() == v.len() {
             msg.unmask();
             if msg.payload.as_slice() == v {
-                println!("receive control message WSPROXY_RECONNECTED");
                 let server = self.server.clone();
                 let data = self.data.clone();
                 tokio::spawn(async move {
                     let mut done = false;
-                    if let Some(pm) = server.pending_moves.lock().await.get(&data.distributed_id) {
-                        if pm.pending_count.fetch_sub(1, Ordering::Relaxed) <= 1 {
+                    if let Some(pm) = server.pending_moves.lock().await.get_mut(&data.distribution_id) {
+                        pm.pending_count -= 1;
+                        if pm.pending_count == 0 {
                             done = true;
+                            info!("distribution {}: all {} connections successfully moved", data.distribution_id, pm.old_connections.len());
                         }
                     }
                     if done {
-                        server.pending_done(&data.distributed_id).await;
+                        server.pending_done(&data.distribution_id).await;
                     }
                 });
 
@@ -153,14 +162,15 @@ impl ProxyServer {
     }
 
     async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) {
+        let loc = self.location_manager.get_location(data.distribution_id.clone()).await;
+
+        let mut socket = match Box::pin(loc.get_connection(data.borrow())).await {
+            Some(s) => s,
+            None => return
+        };
         let task = async move {
 
-            let loc = self.location_manager.get_location(data.distributed_id.clone()).await;
 
-            let mut socket: SocketWrapper = match Box::pin(loc.get_connection(data.borrow())).await {
-                Some(s) => s,
-                None => return
-            };
             let (r, w) = socket.split();
             // println!("ProxyServer websocket_created");
             let cml = ControlMessageListener {
@@ -177,16 +187,16 @@ impl ProxyServer {
             let ws_conn = WsConnection {
                 data: data.clone(),
                 abort_handle: handle,
-                distribution_id: data.query_params.values().next().unwrap().to_string(),
                 client_sender: send_clone
             };
             self.distribution
-                .entry(data.distributed_id.clone())
+                .entry(data.distribution_id.clone())
                 .or_insert_with(|| vec![])
                 .push(ws_conn);
+
             let _ = fut.await;
 
-            if let Occupied(mut entry) = self.distribution.entry(data.distributed_id.clone()) {
+            if let Occupied(mut entry) = self.distribution.entry(data.distribution_id.clone()) {
                 let conns = entry.get_mut();
                 conns.iter().position(|v| v.data.id == data.id).map(|ind| conns.remove(ind));
                 if conns.len() == 0 {
@@ -203,11 +213,13 @@ impl ProxyServer {
     async fn websocket_closed(self: Arc<ProxyServer>, _data: Arc<WebsocketData>) {}
 
     pub async fn move_distribution(self: Arc<ProxyServer>, distribution_id: String) {
-
-        println!("PS move_distribution");
-        // rewrite distribution map, so all new connections will end up in new location
         let mut pending_map = self.pending_moves.lock().await;
         if pending_map.contains_key(&distribution_id) || !self.distribution.contains_key(&distribution_id) {
+            if pending_map.contains_key(&distribution_id) {
+                warn!("distribution {}: trying to move already pending distribution", distribution_id);
+            } else if !self.distribution.contains_key(&distribution_id) {
+                warn!("distribution {}: trying to move non-exist(all connections was closed) distribution", distribution_id);
+            }
             return;
         }
 
@@ -216,7 +228,7 @@ impl ProxyServer {
         let mut conns = self.distribution.get_mut(&distribution_id).unwrap();
         let mut i = 0;
         while i < conns.len() {
-            if conns[i].distribution_id == distribution_id {
+            if conns[i].data.distribution_id == distribution_id {
                 moving_connections.push(conns.remove(i));
             } else {
                 i += 1
@@ -224,11 +236,18 @@ impl ProxyServer {
         }
         drop(conns);
 
+        info!("distribution {}: moving {} connections", distribution_id, moving_connections.len());
+
         let proxy_server = self.clone();
         let d_id = distribution_id.clone();
         let (fut, handle) = abortable(async move {
-            delay_for(Duration::from_secs(30)).await;
-            println!("timeout for distribution id {}", d_id);
+            delay_for(Duration::from_secs(5)).await;
+
+            warn!("distribution {}: move timeout! {} connections left",
+                  d_id,
+                  proxy_server.pending_moves.lock().await.get(&d_id)
+                      .map(|v| v.pending_count).unwrap_or(0)
+            );
             proxy_server.pending_done(&d_id).await;
         });
         for conn in moving_connections.iter_mut() {
@@ -242,7 +261,7 @@ impl ProxyServer {
         }
 
         let pm = PendingMove {
-            pending_count: AtomicU32::new(moving_connections.len() as u32),
+            pending_count: moving_connections.len() as u32,
             old_connections: moving_connections,
             timeout_abort: handle
         };
@@ -253,8 +272,7 @@ impl ProxyServer {
     }
 
     async fn pending_done(&self, distribution_id: &str) {
-        if let Some(pm) = self.pending_moves.lock().await.remove(distribution_id) {
-            pm.pending_count.store(0, Ordering::Relaxed);
+        if let Some(mut pm) = self.pending_moves.lock().await.remove(distribution_id) {
             pm.old_connections.iter().for_each(|c|c.abort_handle.abort());
             pm.timeout_abort.abort();
         }
