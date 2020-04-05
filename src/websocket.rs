@@ -75,6 +75,26 @@ impl RawMessage {
             }
         }
     }
+
+    pub fn close_message() -> Self {
+        Self {
+            fin: true,
+            opcode: MessageOpCode::Close,
+            mask: false,
+            mask_key: [0; 4],
+            payload: vec![0x0f, 0xa0],
+        }
+    }
+
+    pub fn text_message(text: Vec<u8>) -> RawMessage {
+        Self {
+            fin: true,
+            opcode: MessageOpCode::TextFrame,
+            mask: false,
+            mask_key: [0; 4],
+            payload: text
+        }
+    }
 }
 
 #[derive(Default)]
@@ -93,9 +113,7 @@ impl Debug for WebsocketData {
             .field("id", &format!("{:X}", self.id))
             .field("distribution_id", &self.distribution_id)
             .field("path", &self.path)
-            .finish();
-            // .field("headers", &self.headers)
-            // .field("query_params", &self.query_params);
+            .finish().unwrap();
 
         return Ok(())
     }
@@ -175,7 +193,13 @@ impl WebsocketServerInner {
                 handle,
             };
             self.connections.write().await.push(conn);
-            let _ = fut.await;
+            match fut.await {
+
+                Err(_) => {
+                    crate::websocket_util::send_message(RawMessage::close_message(), &mut socket).await;
+                },
+                Ok(_) => {}
+            }
             // println!("Kappa!");
             let mut arr = self.connections.write().await;
             arr.iter().position(|v| v.data.id == data.id).map(|v| arr.remove(v));
@@ -213,7 +237,7 @@ impl WebsocketServerInner {
             HTTP/1.1 101 Switching Protocols\r\n\
             Upgrade: websocket\r\n\
             Connection: Upgrade\r\n\
-        ").await;
+        ").await?;
 
         socket.write(
             format!("Sec-WebSocket-Accept: {}\r\n", resp_key).as_bytes()

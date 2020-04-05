@@ -9,12 +9,11 @@ use tokio::time::{delay_for, Duration};
 use futures::future::abortable;
 use tokio::select;
 use std::pin::Pin;
-use std::fmt::{Debug, Formatter, Error};
+use std::fmt::{Debug, Formatter};
 use std::borrow::Borrow;
 use tokio::net::tcp::{WriteHalf, ReadHalf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::collections::HashMap;
-use crate::location_manager::{LocationManager, SocketWrapper, LocationManagerMessage};
+use crate::location_manager::{LocationManager, LocationManagerMessage};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry::Occupied;
 use std::ops::Deref;
@@ -103,7 +102,7 @@ struct ControlMessageListener {
 
 impl MessageListener for ControlMessageListener {
     fn handle(&self, mut msg: RawMessage) -> Option<RawMessage> {
-        let v = b"WSPROXY_RECONNECTED";
+        let v = &b"WSPROXY_MOVE_DONE"[..];
         if msg.payload.len() == v.len() {
             msg.unmask();
             if msg.payload.as_slice() == v {
@@ -241,7 +240,7 @@ impl ProxyServer {
         let proxy_server = self.clone();
         let d_id = distribution_id.clone();
         let (fut, handle) = abortable(async move {
-            delay_for(Duration::from_secs(5)).await;
+            delay_for(Duration::from_secs(20)).await;
 
             warn!("distribution {}: move timeout! {} connections left",
                   d_id,
@@ -256,7 +255,7 @@ impl ProxyServer {
                 opcode: MessageOpCode::TextFrame,
                 mask: false,
                 mask_key: [0u8; 4],
-                payload: b"WSPROXY_DISCONNECTED".to_vec()
+                payload: b"{\"notification\":true,\"method\":\"WSPROXY_MOVE_START\",\"data\":{}}".to_vec()
             }).await.unwrap();
         }
 
@@ -272,8 +271,21 @@ impl ProxyServer {
     }
 
     async fn pending_done(&self, distribution_id: &str) {
-        if let Some(mut pm) = self.pending_moves.lock().await.remove(distribution_id) {
-            pm.old_connections.iter().for_each(|c|c.abort_handle.abort());
+
+        if let Some(d) = self.distribution.get(distribution_id) {
+            for conn in d.value() {
+                conn.client_sender.clone()
+                    .send(RawMessage::text_message("{\"notification\":true,\"method\":\"WSPROXY_MOVE_END\",\"data\":{}}".to_string().into_bytes()))
+                    .await.err().map(|e| error!("Couldn't send 'WSPROXY_MOVE_END' message because of: {:?}", e));
+            }
+        }
+
+        // If we drop old connection too fast after
+        // WSPROXY_MOVE_END message they couldn't not have time to move.
+        delay_for(Duration::from_secs(1)).await;
+
+        if let Some(pm) = self.pending_moves.lock().await.remove(distribution_id) {
+            pm.old_connections.iter().for_each(|c| c.abort_handle.abort());
             pm.timeout_abort.abort();
         }
     }
