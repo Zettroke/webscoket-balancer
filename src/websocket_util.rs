@@ -1,7 +1,8 @@
-use crate::websocket::{RawMessage, MAX_MESSAGE_SIZE, MessageOpCode};
+use crate::websocket::MAX_MESSAGE_SIZE;
 use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncWrite};
 use bytes::{BufMut, Buf};
 use thiserror::Error;
+use crate::message::{RawMessage, MessageOpCode};
 
 #[derive(Error, Debug)]
 pub enum MessageError{
@@ -10,7 +11,8 @@ pub enum MessageError{
     #[error("Bad message format")]
     Format,
     #[error("Message size: {size} bytes too big. Max size is {max_size}")]
-    MessageTooBig { size: u64, max_size: u64 }
+    MessageTooBig { size: u64, max_size: u64 },
+
 }
 
 pub async fn receive_message<T: AsyncReadExt + Unpin>(reader: &mut T) -> Result<RawMessage, MessageError> {
@@ -57,7 +59,7 @@ pub async fn receive_message<T: AsyncReadExt + Unpin>(reader: &mut T) -> Result<
     });
 }
 
-pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T) {
+pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T) -> Result<(), std::io::Error> {
     let mut out = bytes::BytesMut::new();
     out.put_u8(((msg.fin as u8) << 7) | (msg.opcode as u8));
 
@@ -75,5 +77,6 @@ pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T
         out.put_slice(&msg.mask_key);
     }
     out.put_slice(msg.payload.as_slice());
-    writer.write(out.bytes()).await.unwrap();
+    writer.write(out.bytes()).await?;
+    Ok(())
 }

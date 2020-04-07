@@ -1,10 +1,12 @@
-use webscoket_balancer::kappa;
-use webscoket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection};
-use webscoket_balancer::proxy::ProxyServer;
+use websocket_balancer::kappa;
+use websocket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection, WebsocketData};
+use websocket_balancer::proxy::{ProxyServer, ProxyServerBuilder};
 use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
-use webscoket_balancer::location_manager::LocationManager;
+use websocket_balancer::location_manager::LocationManager;
 use std::sync::atomic::Ordering;
+
+#[macro_use] extern crate log;
 
 #[tokio::main]
 async fn main() {
@@ -14,12 +16,15 @@ async fn main() {
     lm.add_location("127.0.0.1:1339".to_string()).await;
     let lmm = lm.clone();
 
-    let ps = ProxyServer::new(lm.clone());
-    let _pss = ps.clone();
+    let ps = ProxyServerBuilder::new()
+        .location_manager(lm.clone())
+        .move_start_message("{\"notification\":true,\"method\":\"WSPROXY_MOVE_START\",\"data\":{}}".to_string())
+        .move_done_message("WSPROXY_MOVE_DONE".to_string())
+        .move_end_message("{\"notification\":true,\"method\":\"WSPROXY_MOVE_END\",\"data\":{}}".to_string())
+        .build();
 
-    // ps.add_location("127.0.0.1:1338".to_string()).await;
-    // ps.add_location("127.0.0.1:1339".to_string()).await;
-// Code you want to sample goes here!
+    let _pss = ps.clone();
+    tokio::spawn(ps.run());
 
     let s = WebsocketServerBuilder::new()
         .address("127.0.0.1:1337")
@@ -68,12 +73,12 @@ async fn main() {
                     if res.len() == 2 {
                         let arr = s.get_connections().await;
                         let found: Vec<&WebsocketConnection> = arr.iter().filter(|v| {
-                            format!("{:X}", v.data.id).starts_with(res[1])
+                            v.data.id.starts_with(res[1])
                         }).collect();
                         if found.len() > 1 {
                             println!("Found multiple connection. Enter more accurate id.");
                             for v in found.iter() {
-                                println!("{:X}", v.data.id);
+                                println!("{}", v.data.id);
                             }
                         } else {
                             found[0].handle.abort();
@@ -82,7 +87,9 @@ async fn main() {
                     println!("close");
                 },
                 "help" => {
-                    println!("p - prints current connections")
+                    println!("p [n] - prints n connections");
+                    println!("proxies - show ");
+                    println!("proxy move <distribution_id> - move distribution to another location");
                 }
                 _ => {
                     println!("Unknown command!");
@@ -90,7 +97,10 @@ async fn main() {
             }
         }
     });
+    // debug!("RawMessage size: {}", std::mem::size_of::<RawMessage>());
+    // debug!("WebsocketData size: {}", std::mem::size_of::<WebsocketData>());
     ss.run().await;
     println!("{}", kappa());
+
 
 }

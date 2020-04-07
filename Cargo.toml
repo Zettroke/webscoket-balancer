@@ -1,5 +1,5 @@
 [package]
-name = "webscoket-balancer"
+name = "websocket-balancer"
 version = "0.1.0"
 authors = ["Zettroke <skorostnoy2000@yandex.ru>"]
 edition = "2018"

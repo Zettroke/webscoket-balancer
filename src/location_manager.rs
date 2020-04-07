@@ -7,19 +7,31 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering, AtomicBool};
 use tokio::sync::broadcast;
+use thiserror::Error;
+use futures::io::ErrorKind;
+use crate::location_manager::ConnectionError::Handshake;
 
+#[derive(Error, Debug)]
+pub enum ConnectionError {
+    #[error("Socket connection error: {0:?}")]
+    Socket(#[from] std::io::Error),
+    #[error("Handshake error")]
+    Handshake(String)
+}
+
+#[derive(Debug)]
 pub struct ProxyLocation {
     pub address: String,
-    pub connection_count: AtomicU32
+    pub connection_count: AtomicU32,
+    pub dead: AtomicBool
 }
 
 pub struct SocketWrapper {
     loc: Arc<ProxyLocation>,
     inner: TcpStream
 }
-
 impl Deref for SocketWrapper {
     type Target = TcpStream;
 
@@ -27,7 +39,6 @@ impl Deref for SocketWrapper {
         &self.inner
     }
 }
-
 impl DerefMut for SocketWrapper {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
@@ -41,7 +52,7 @@ impl Drop for SocketWrapper {
 
 
 impl ProxyLocation {
-    pub async fn get_connection(self: Arc<ProxyLocation>, data: &WebsocketData) -> Option<SocketWrapper> {
+    pub async fn get_connection(self: Arc<ProxyLocation>, data: &WebsocketData) -> Result<SocketWrapper, ConnectionError> {
         let mut body = bytes::BytesMut::new();
         body.put_slice(b"GET ");
 
@@ -72,23 +83,16 @@ impl ProxyLocation {
             }
         }
         body.put_slice(b"\r\n");
-        // println!("{:#?}", data.headers);
-        // println!("body {}", String::from_utf8(body.bytes().to_vec()).unwrap());
-        let mut socket = match TcpStream::connect(self.address.clone()).await {
-            Ok(s) => s,
-            Err(e) => {
-                println!("socket connect error: {}", e);
-                return None;
-            }
-        };
-        socket.write_all(body.bytes()).await.unwrap();
-        // println!("keepalive {:?}", socket.keepalive());
+
+        let mut socket = TcpStream::connect(self.address.clone()).await?;
+
+        socket.write_all(body.bytes()).await?;
 
         let mut buff= [0u8; 2048];
         let mut prev_packet_ind = 0;
         let mut handshake = Vec::new();
         loop {
-            let n = socket.read(&mut buff).await.ok()?;
+            let n = socket.read(&mut buff).await?;
 
             handshake.extend_from_slice(&buff[0..n]);
 
@@ -119,13 +123,20 @@ impl ProxyLocation {
             }
             prev_packet_ind += n;
             if n == 0 {
-                return None;
+                return Err(
+                    ConnectionError::Socket(
+                        std::io::Error::new(ErrorKind::UnexpectedEof, "EOF".to_string())
+                    )
+                );
             }
         }
         // TODO: Handshake check!
+        if false {
+            return Err(Handshake("bad handshake".to_string()));
+        }
 
-        self.connection_count.fetch_add(1, Ordering::Relaxed);
-        Some(SocketWrapper{
+        self.connection_count.fetch_add(1, Ordering::Release);
+        Ok(SocketWrapper{
             inner: socket,
             loc: self.clone()
         })
@@ -153,8 +164,8 @@ impl LocationManager {
         }
     }
 
-    pub async fn move_distribution(&self, d_id: String) {
-        let loc = self.find_best_location().await;
+    pub async fn move_distribution(&self, d_id: String) -> Option<()> {
+        let loc = self.find_best_location().await?;
         self.distributions.entry(d_id.clone()).and_modify(|l| {
             std::mem::replace(l, loc.clone());
         });
@@ -165,9 +176,10 @@ impl LocationManager {
                 new_loc: loc
             }
         ).unwrap_or(0);
+        Some(())
     }
 
-    pub async fn get_location(&self, distribution_id: String) -> Arc<ProxyLocation> {
+    pub async fn get_location(&self, distribution_id: String) -> Option<Arc<ProxyLocation>> {
 
         let entry = self.distributions.entry(distribution_id);
         let loc = match entry {
@@ -175,19 +187,20 @@ impl LocationManager {
                 e.get().clone()
             },
             Entry::Vacant(e) => {
-                let loc = self.find_best_location().await;
+                let loc = self.find_best_location().await?;
                 e.insert(loc.clone());
                 loc
             }
         };
 
-        loc
+        Some(loc)
     }
 
     pub async fn add_location(&self, addr: String) {
         self.locations.write().await.push(Arc::new(ProxyLocation {
             address: addr,
-            connection_count: AtomicU32::new(0)
+            connection_count: AtomicU32::new(0),
+            dead: AtomicBool::new(false)
         }))
     }
 
@@ -195,9 +208,20 @@ impl LocationManager {
         self.channel.subscribe()
     }
 
-    async fn find_best_location(&self) -> Arc<ProxyLocation> {
-        self.locations.read().await.iter()
-            .min_by_key(|v| v.connection_count.load(Ordering::Relaxed))
-            .unwrap().clone()
+    pub async fn mark_dead(&self, loc: Arc<ProxyLocation>) {
+        if !loc.dead.compare_and_swap(false, true, Ordering::AcqRel) {
+            return;
+        } else {
+            // do something....
+            //
+        }
+    }
+
+    async fn find_best_location(&self) -> Option<Arc<ProxyLocation>> {
+        Some(
+            self.locations.read().await.iter()
+                .min_by_key(|v| v.connection_count.load(Ordering::Acquire))?
+                .clone()
+        )
     }
 }

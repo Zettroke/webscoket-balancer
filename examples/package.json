@@ -1,12 +1,14 @@
 {
   "name": "ws-balancer-test",
   "dependencies": {
-    "ws": "^7.2.3"
+    "ws": "^7.2.3",
+    "nodejs-websocket": "^1.7.2"
   },
   "devDependencies": {},
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "server": "node server.js",
+    "server2": "node server2.js",
     "client": "node client.js"
   },
   "author": "Zettroke"
