@@ -15,25 +15,9 @@ use futures::future::{abortable, AbortHandle};
 use std::fmt::{Debug, Formatter};
 use crate::ServerChannel;
 use crate::message::{RawMessage, MessageOpCode};
-use crate::websocket_util::MessageError;
+use crate::websocket_util::{MessageError, HandshakeError};
 
 pub static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
-
-#[derive(Error, Debug)]
-enum HandshakeError {
-    #[error("Bad request")]
-    BadRequest,
-    #[error("Headers parsing error: {0:?}")]
-    HeadersParsing(#[from] httparse::Error),
-    #[error("Handshake request was canceled")]
-    SocketClosed,
-    #[error("Missed header \"{0}\" in handshake request")]
-    MissedHeader(String),
-    #[error("Header \"{0}\" has bad value \"{1}\"")]
-    BadHeaderValue(String, String),
-    #[error("IO error happened: {0:?}")]
-    IOError(#[from] std::io::Error),
-}
 
 #[derive(Default)]
 pub struct WebsocketData {
@@ -108,7 +92,12 @@ impl WebsocketServerInner {
         // send pair
         let (tx2, rx2) = mpsc::channel::<RawMessage>(5);
 
-        self.channel.websocket_created(data.clone(), rx, tx2).await;
+        match self.channel.websocket_created(data.clone(), rx, tx2).await {
+            Ok(_) => {},
+            Err(e) => {
+                error!("{:?}", e);
+            }
+        }
         // if not err { handshake_complete(socket) }
         let (r, w) = socket.split();
         {
@@ -140,7 +129,7 @@ impl WebsocketServerInner {
     }
 
     async fn handshake(&self, socket: &mut TcpStream) -> Result<WebsocketData, HandshakeError> {
-        let mut data = self.receive_handshake_data(socket).await?;
+        let mut data = crate::websocket_util::receive_handshake_data(socket).await?;
 
         // Check connection header
         let conn = data.headers.get("connection").ok_or_else(|| HandshakeError::MissedHeader("connection".to_owned()))?;
@@ -185,89 +174,6 @@ impl WebsocketServerInner {
         socket.write(b"\r\n").await?;
 
         Ok(data)
-    }
-
-    async fn receive_handshake_data(&self, socket: &mut TcpStream) -> Result<WebsocketData, HandshakeError> {
-        let mut handshake: Vec<u8> = Vec::with_capacity(2048);
-        let mut buff = vec![0; 2048].into_boxed_slice();
-        let mut prev_packet_ind: usize = 0;
-        loop {
-            let n = socket.read(&mut buff).await?;
-
-            handshake.extend_from_slice(&buff[0..n]);
-
-            let mut ind = if prev_packet_ind == 0 {
-                0
-            } else {
-                if prev_packet_ind > 3 { prev_packet_ind-3 } else { 0 }
-            };
-            let mut done = false;
-            loop {
-                match memchr::memchr(b'\r', &handshake[ind..handshake.len()]) {
-                    Some(ind_f) => {
-                        let v = ind + ind_f;
-                        if handshake.len() - v >= 4 {
-                            if handshake[v+1..v+4] == [b'\n', b'\r', b'\n'] {
-                                done = true;
-                                break;
-                            }
-                        }
-                        ind = v+1;
-                    },
-                    None => break
-                }
-            }
-
-            if done {
-                break;
-            }
-            prev_packet_ind += n;
-            if n == 0 {
-                return Err(HandshakeError::SocketClosed);
-            }
-        }
-
-        let mut headers = [httparse::EMPTY_HEADER; 30];
-
-        let mut req = httparse::Request::new(&mut headers);
-        req.parse(handshake.as_slice())?;
-
-        let mut res = WebsocketData::default();
-        // TODO: URLdecode
-        let path = req.path.ok_or(HandshakeError::BadRequest)?;
-        let q_index = memchr(b'?', path.as_bytes()).unwrap_or_else(|| path.len());
-        res.path = path[0..q_index].to_string();
-
-        // query string processing
-        if q_index < path.len() {
-            for pair in path[q_index + 1..path.len()].split('&') {
-                match memchr(b'=', pair.as_bytes()) {
-                    Some(ind) => {
-                        res.query_params.insert(
-                            pair[0..ind].to_string(),
-                            pair[ind + 1..pair.len()].to_string()
-                        )
-                    },
-                    None => {
-                        res.query_params.insert(
-                            pair.to_string(),
-                            "".to_string()
-                        )
-                    }
-                };
-            }
-        }
-
-        // header processing
-        for h in headers.iter() {
-            if *h == httparse::EMPTY_HEADER {
-                break;
-            }
-
-            let v = String::from_utf8(h.value.to_vec()).map_err(|_| HandshakeError::BadRequest)?;
-            res.headers.insert(h.name.to_lowercase(), v);
-        }
-        Ok(res)
     }
 
     pub async fn run(self: Arc<WebsocketServerInner>) {

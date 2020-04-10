@@ -2,8 +2,8 @@ use tokio::sync::RwLock;
 use std::sync::Arc;
 use crate::websocket::WebsocketData;
 use tokio::net::TcpStream;
-use bytes::{BufMut, Buf};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use bytes::{BufMut, Buf, BytesMut};
+use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncWrite};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::ops::{Deref, DerefMut};
@@ -11,48 +11,108 @@ use std::sync::atomic::{AtomicU32, Ordering, AtomicBool};
 use tokio::sync::broadcast;
 use thiserror::Error;
 use futures::io::ErrorKind;
-use crate::location_manager::ConnectionError::Handshake;
+use futures::task::{Context, Poll};
+use tokio::macros::support::Pin;
+use std::mem::MaybeUninit;
+use crate::websocket_util::HandshakeError;
+use tokio_tls::TlsStream;
 
-#[derive(Error, Debug)]
-pub enum ConnectionError {
-    #[error("Socket connection error: {0:?}")]
-    Socket(#[from] std::io::Error),
-    #[error("Handshake error")]
-    Handshake(String)
-}
-
-#[derive(Debug)]
+#[derive(Debug, Builder)]
 pub struct ProxyLocation {
+    #[builder(setter(skip))]
+    #[builder(default)]
+    id: u64,
     pub address: String,
+    #[builder(setter(skip))]
+    #[builder(default)]
     pub connection_count: AtomicU32,
-    pub dead: AtomicBool
+    #[builder(setter(skip))]
+    #[builder(default)]
+    pub dead: AtomicBool,
+    #[builder(setter(strip_option))]
+    #[builder(default)]
+    pub domain: Option<String>,
+    #[builder(default)]
+    pub secure: bool
 }
 
-pub struct SocketWrapper {
-    loc: Arc<ProxyLocation>,
-    inner: TcpStream
+impl Default for ProxyLocation {
+    fn default() -> Self {
+        ProxyLocation {
+            id: rand::random(),
+            address: "127.0.0.1:80".to_string(),
+            connection_count: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
+            domain: None,
+            secure: false
+        }
+    }
 }
-impl Deref for SocketWrapper {
-    type Target = TcpStream;
+
+
+pub struct SocketWrapper<T: AsyncRead + AsyncWrite + Unpin> {
+    loc: Arc<ProxyLocation>,
+    inner: T
+}
+impl<T: AsyncRead + AsyncWrite + Unpin> Deref for SocketWrapper<T> {
+    type Target = T;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
-impl DerefMut for SocketWrapper {
+impl<T: AsyncRead + AsyncWrite + Unpin> DerefMut for SocketWrapper<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
-impl Drop for SocketWrapper {
+impl<T: AsyncRead + AsyncWrite + Unpin> Drop for SocketWrapper<T> {
     fn drop(&mut self) {
         self.loc.connection_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
+impl<T: tokio::io::AsyncRead + AsyncWrite + Unpin> AsyncRead for SocketWrapper<T> {
+    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [MaybeUninit<u8>]) -> bool {
+        self.inner.prepare_uninitialized_buffer(buf)
+    }
+
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+
+    fn poll_read_buf<B: BufMut>(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<std::io::Result<usize>> where
+        Self: Sized, {
+        Pin::new(&mut self.inner).poll_read_buf(cx, buf)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SocketWrapper<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_buf<B: Buf>(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<std::io::Result<usize>> where
+        Self: Sized, {
+        Pin::new(&mut self.inner).poll_write_buf(cx, buf)
+    }
+}
+
 
 impl ProxyLocation {
-    pub async fn get_connection(self: Arc<ProxyLocation>, data: &WebsocketData) -> Result<SocketWrapper, ConnectionError> {
+    pub fn new() -> ProxyLocationBuilder {
+        ProxyLocationBuilder::default()
+    }
+
+    async fn send_handshake<T: AsyncWrite + Unpin>(&self, socket: &mut T, data: &WebsocketData) -> Result<(), HandshakeError> {
         let mut body = bytes::BytesMut::new();
         body.put_slice(b"GET ");
 
@@ -73,7 +133,7 @@ impl ProxyLocation {
         for (k, v) in data.headers.iter() {
             if k == "host" {
                 body.put_slice(b"host: ");
-                body.put_slice(self.address.as_bytes());
+                body.put_slice(self.domain.as_ref().unwrap_or(&self.address).as_bytes());
                 body.put_slice(b"\r\n");
             } else if k != "sec-websocket-extensions" {
                 body.put_slice(k.as_bytes());
@@ -83,63 +143,33 @@ impl ProxyLocation {
             }
         }
         body.put_slice(b"\r\n");
+        socket.write_all(body.as_ref()).await?;
+        Ok(())
+    }
 
+    pub async fn get_plain_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TcpStream, HandshakeError> {
         let mut socket = TcpStream::connect(self.address.clone()).await?;
 
-        socket.write_all(body.bytes()).await?;
+        self.connect(socket, data).await
+    }
 
-        let mut buff= [0u8; 2048];
-        let mut prev_packet_ind = 0;
-        let mut handshake = Vec::new();
-        loop {
-            let n = socket.read(&mut buff).await?;
+    pub async fn get_secure_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TlsStream<TcpStream>, HandshakeError> {
+        let socket = TcpStream::connect(self.address.as_str()).await?;
+        let cx = native_tls::TlsConnector::builder().build()?;
+        let cx = tokio_tls::TlsConnector::from(cx);
 
-            handshake.extend_from_slice(&buff[0..n]);
+        let tls_socket = cx.connect(self.domain.as_ref().map(|s| s.as_str()).unwrap_or(""), socket).await?;
 
-            let mut ind = if prev_packet_ind == 0 {
-                0
-            } else {
-                if prev_packet_ind > 3 { prev_packet_ind-3 } else { 0 }
-            };
-            let mut done = false;
-            loop {
-                match memchr::memchr(b'\r', &handshake[ind..handshake.len()]) {
-                    Some(ind_f) => {
-                        let v = ind + ind_f;
-                        if handshake.len() - v >= 4 {
-                            if handshake[v+1..v+4] == [b'\n', b'\r', b'\n'] {
-                                done = true;
-                                break;
-                            }
-                        }
-                        ind = v+1;
-                    },
-                    None => break
-                }
-            }
+        self.connect(tls_socket, data).await
+    }
 
-            if done {
-                break;
-            }
-            prev_packet_ind += n;
-            if n == 0 {
-                return Err(
-                    ConnectionError::Socket(
-                        std::io::Error::new(ErrorKind::UnexpectedEof, "EOF".to_string())
-                    )
-                );
-            }
-        }
-        // TODO: Handshake check!
-        if false {
-            return Err(Handshake("bad handshake".to_string()));
-        }
+    async fn connect<T: AsyncRead + AsyncWrite + Unpin>(self:&ProxyLocation, mut socket: T, data: &WebsocketData) -> Result<T, HandshakeError> {
+        self.send_handshake(&mut socket, data).await?;
+
+        let _v = crate::websocket_util::read_headers(&mut socket).await?;
 
         self.connection_count.fetch_add(1, Ordering::Release);
-        Ok(SocketWrapper{
-            inner: socket,
-            loc: self.clone()
-        })
+        Ok(socket)
     }
 }
 
@@ -180,7 +210,6 @@ impl LocationManager {
     }
 
     pub async fn get_location(&self, distribution_id: String) -> Option<Arc<ProxyLocation>> {
-
         let entry = self.distributions.entry(distribution_id);
         let loc = match entry {
             Entry::Occupied(e) => {
@@ -196,30 +225,29 @@ impl LocationManager {
         Some(loc)
     }
 
-    pub async fn add_location(&self, addr: String) {
-        self.locations.write().await.push(Arc::new(ProxyLocation {
-            address: addr,
-            connection_count: AtomicU32::new(0),
-            dead: AtomicBool::new(false)
-        }))
+    pub async fn add_location(&self, mut loc: ProxyLocation) {
+        let mut loc_list = self.locations.write().await;
+        while loc_list.iter().any(|v| v.id == loc.id) {
+            loc.id = rand::random();
+        }
+        loc_list.push(Arc::new(loc));
     }
 
     pub fn get_message_recv(&self) -> broadcast::Receiver<LocationManagerMessage> {
         self.channel.subscribe()
     }
 
-    pub async fn mark_dead(&self, loc: Arc<ProxyLocation>) {
-        if !loc.dead.compare_and_swap(false, true, Ordering::AcqRel) {
-            return;
-        } else {
-            // do something....
-            //
-        }
+    pub async fn mark_dead(&self, loc: &ProxyLocation) {
+        loc.dead.store(true, Ordering::Release);
+
+        // remove all distributions linked to dead location
+        self.distributions.retain(|k, v| v.id != loc.id);
     }
 
     async fn find_best_location(&self) -> Option<Arc<ProxyLocation>> {
         Some(
             self.locations.read().await.iter()
+                .filter(|v| !v.dead.load(Ordering::Acquire))
                 .min_by_key(|v| v.connection_count.load(Ordering::Acquire))?
                 .clone()
         )

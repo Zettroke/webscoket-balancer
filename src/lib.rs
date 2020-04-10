@@ -6,7 +6,7 @@ use std::pin::Pin;
 use crate::message::RawMessage;
 
 #[macro_use] extern crate log;
-
+#[macro_use] extern crate derive_builder;
 
 pub mod websocket;
 pub mod proxy;

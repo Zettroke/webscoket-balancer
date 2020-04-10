@@ -3,7 +3,7 @@ use websocket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection,
 use websocket_balancer::proxy::{ProxyServer, ProxyServerBuilder};
 use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
-use websocket_balancer::location_manager::LocationManager;
+use websocket_balancer::location_manager::{LocationManager, ProxyLocation};
 use std::sync::atomic::Ordering;
 
 #[macro_use] extern crate log;
@@ -12,8 +12,10 @@ use std::sync::atomic::Ordering;
 async fn main() {
     env_logger::init();
     let lm = Arc::new(LocationManager::new());
-    lm.add_location("127.0.0.1:1338".to_string()).await;
-    lm.add_location("127.0.0.1:1339".to_string()).await;
+    lm.add_location(ProxyLocation::new().address("127.0.0.1:13338".to_string()).secure(false).build().unwrap()).await;
+    lm.add_location(ProxyLocation::new().address("127.0.0.1:13339".to_string()).secure(false).build().unwrap()).await;
+    // lm.add_location().await;
+    // lm.add_location("127.0.0.1:13339".to_string()).await;
     let lmm = lm.clone();
 
     let ps = ProxyServerBuilder::new()
@@ -60,7 +62,7 @@ async fn main() {
                     let v = lmm.locations.read().await;
                     println!("got 1 lock");
                     for pl in v.iter() {
-                        println!("{:?} got {} connections", pl.address, pl.connection_count.load(Ordering::Relaxed));
+                        println!("{:?} got {} connections. dead - {}", pl.address, pl.connection_count.load(Ordering::Relaxed), pl.dead.load(Ordering::Relaxed));
                     }
                 },
                 "proxy" => {

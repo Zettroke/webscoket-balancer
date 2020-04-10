@@ -13,13 +13,16 @@ use std::fmt::{Debug, Formatter};
 use std::borrow::Borrow;
 use tokio::net::tcp::{WriteHalf, ReadHalf};
 use std::collections::HashMap;
-use crate::location_manager::{LocationManager, LocationManagerMessage, SocketWrapper, ConnectionError};
+use crate::location_manager::{LocationManager, LocationManagerMessage, SocketWrapper, ProxyLocation};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry::Occupied;
 use std::ops::Deref;
 use rand::Rng;
-use crate::websocket_util::MessageError;
+use crate::websocket_util::{MessageError, HandshakeError};
 use crate::message::{RawMessage, MessageOpCode};
+use tokio::io::{AsyncWrite, AsyncRead};
+use tokio::net::TcpStream;
+use std::sync::atomic::Ordering;
 
 // #[derive(Error)]
 // pub enum LocationWebsocketError {
@@ -42,7 +45,7 @@ impl Debug for WsConnection {
 }
 
 impl WsConnection {
-    async fn send_loop<T: MessageListener>(mut write: WriteHalf<'_>, recv: &mut mpsc::Receiver<RawMessage>, client_msg_handler: T) -> std::io::Result<()> {
+    async fn send_loop<W: AsyncWrite + Unpin, T: MessageListener>(mut write: W, recv: &mut mpsc::Receiver<RawMessage>, client_msg_handler: T) -> std::io::Result<()> {
         // println!("send_loop");
         loop {
             match recv.recv().await {
@@ -60,7 +63,7 @@ impl WsConnection {
         }
     }
 
-    async fn receive_loop(mut read: ReadHalf<'_>, send: &mut mpsc::Sender<RawMessage>) -> std::io::Result<()> {
+    async fn receive_loop<R: AsyncRead + Unpin>(mut read: R, send: &mut mpsc::Sender<RawMessage>) -> std::io::Result<()> {
         loop {
             match crate::websocket_util::receive_message(&mut read).await {
                 Ok(msg) => {
@@ -80,6 +83,7 @@ impl WsConnection {
     }
 }
 
+#[derive(Debug)]
 pub struct PendingMove {
     old_connections: Vec<WsConnection>,
     pending_count: u32,
@@ -112,6 +116,7 @@ impl MessageListener for ControlMessageListener {
         if msg.payload.len() == v.len() {
             msg.unmask();
             if msg.payload.as_slice() == v {
+                info!("Websocket {} move done!", self.data.id);
                 let server = self.server.clone();
                 let data = self.data.clone();
                 tokio::spawn(async move {
@@ -120,8 +125,10 @@ impl MessageListener for ControlMessageListener {
                         pm.pending_count -= 1;
                         if pm.pending_count == 0 {
                             done = true;
-                            info!("distribution {}: all {} connections successfully moved", data.distribution_id, pm.old_connections.len());
+                            info!("Distribution {}: all {} connections successfully moved", data.distribution_id, pm.old_connections.len());
                         }
+                    } else {
+
                     }
                     if done {
                         server.pending_done(&data.distribution_id).await;
@@ -151,32 +158,30 @@ impl ProxyServer {
                         }
                     },
                     Err(e) => {
-                        error!("location manager channel error: {}", e);
+                        error!("Location manager channel error: {}", e);
                     }
                 }
             }
         })
     }
 
-    async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) -> Result<(), String> {
-
-        let loc = match self.location_manager.get_location(data.distribution_id.clone()).await {
-            Some(loc) => loc,
-            None => {
-                error!("Couldn't find proxy location");
-                return Err("Couldn't find proxy location".to_string())
-            }
-        };
-
+    async fn try_get_connection<'a, T, Ret>(
+        self: &'a ProxyServer,
+        f: fn(&'a ProxyLocation, &'a WebsocketData) -> Ret,
+        loc: &'a ProxyLocation,
+        data: &'a WebsocketData
+    ) -> Result<T, String>
+        where Ret: Future<Output=Result<T, HandshakeError>>
+    {
         let mut retries = 5u32;
-        let mut socket: SocketWrapper = loop {
-            match Box::pin(loc.clone().get_connection(data.borrow())).await {
+        let mut socket: T = loop {
+            match Box::pin((f)(loc, data)).await {
                 Ok(s) => break s,
-                Err(ConnectionError::Socket(e)) => {
+                Err(HandshakeError::IOError(e)) => {
                     if retries == 0 {
-                        self.location_manager.mark_dead(loc.clone()).await;
+                        self.location_manager.mark_dead(loc).await;
                         // TODO: keep trying new locations
-                        error!("Couldn't connect to location {:?}", &loc);
+                        error!("{:?} Couldn't connect to location {:?}",e , loc);
                         return Err("Kappa".to_string());
                     } else {
                         debug!("retrying, retries left: {}", retries);
@@ -185,52 +190,83 @@ impl ProxyServer {
                         delay_for(Duration::from_millis(t)).await;
                     }
                 },
-                Err(ConnectionError::Handshake(msg)) => {
-                    return Err(msg);
+                Err(e) => {
+                    return Err(format!("{}", e));
                 }
             };
         };
 
-        let task = async move {
+        Ok(socket)
+    }
 
-            let (r, w) = socket.split();
-            // println!("ProxyServer websocket_created");
-            let cml = ControlMessageListener {
-                data: data.clone(),
-                server: self.clone()
-            };
-            let send_clone = send.clone();
-            let (fut, handle) = abortable(async {
-                select! {
+    async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) -> Result<(), String> {
+        let loc = match self.location_manager.get_location(data.distribution_id.clone()).await {
+            Some(loc) => loc,
+            None => {
+                error!("Couldn't find proxy location");
+                return Err("Couldn't find proxy location".to_string())
+            }
+        };
+
+
+
+        if loc.secure {
+            let socket = self.try_get_connection(ProxyLocation::get_secure_connection, &loc, data.deref()).await?;
+            info!("Proxying websocket {} to location {}", data.id, loc.address);
+            tokio::spawn(self.handler(socket, data, loc, recv, send));
+        } else {
+            let socket= self.try_get_connection(ProxyLocation::get_plain_connection, &loc, data.deref()).await?;
+            info!("Proxying websocket {} to location {}", data.id, loc.address);
+            tokio::spawn(self.handler(socket, data, loc, recv, send));
+        }
+
+
+        Ok(())
+    }
+
+    async fn handler<S>(
+        self: Arc<ProxyServer>,
+        socket: S,
+        data: Arc<WebsocketData>,
+        loc: Arc<ProxyLocation>,
+        mut recv: mpsc::Receiver<RawMessage>,
+        mut send: mpsc::Sender<RawMessage>
+    )
+    where S: AsyncRead + AsyncWrite + Unpin
+    {
+        let (r, w) = tokio::io::split(socket);
+        // println!("ProxyServer websocket_created");
+        let cml = ControlMessageListener {
+            data: data.clone(),
+            server: self.clone()
+        };
+        let send_clone = send.clone();
+        let (fut, handle) = abortable(async {
+            select! {
                     d = WsConnection::send_loop(w, &mut recv, cml) => {d}
                     d = WsConnection::receive_loop(r, &mut send) => {d}
                 }
-            });
-            let ws_conn = WsConnection {
-                data: data.clone(),
-                abort_handle: handle,
-                client_sender: send_clone
-            };
-            self.distribution
-                .entry(data.distribution_id.clone())
-                .or_insert_with(|| vec![])
-                .push(ws_conn);
-
-            let _ = fut.await;
-
-            if let Occupied(mut entry) = self.distribution.entry(data.distribution_id.clone()) {
-                let conns = entry.get_mut();
-                conns.iter().position(|v| v.data.id == data.id).map(|ind| conns.remove(ind));
-                if conns.len() == 0 {
-                    entry.remove();
-                }
-            }
-            // println!("Proxy closed");
-            // println!("Ended");
+        });
+        let ws_conn = WsConnection {
+            data: data.clone(),
+            abort_handle: handle,
+            client_sender: send_clone
         };
-        // debug!("proxy future size: {}", get_size(&task));
-        tokio::spawn(task);
-        Ok(())
+        self.distribution
+            .entry(data.distribution_id.clone())
+            .or_insert_with(|| vec![])
+            .push(ws_conn);
+        let _ = fut.await;
+
+        info!("Websocket {} disconnected from location {}", data.id, loc.address);
+        loc.connection_count.fetch_sub(1, Ordering::Relaxed);
+        if let Occupied(mut entry) = self.distribution.entry(data.distribution_id.clone()) {
+            let conns = entry.get_mut();
+            conns.iter().position(|v| v.data.id == data.id).map(|ind| conns.remove(ind));
+            if conns.len() == 0 {
+                entry.remove();
+            }
+        }
     }
 
     async fn websocket_closed(self: Arc<ProxyServer>, _data: Arc<WebsocketData>) {}
@@ -239,9 +275,9 @@ impl ProxyServer {
         let mut pending_map = self.pending_moves.lock().await;
         if pending_map.contains_key(&distribution_id) || !self.distribution.contains_key(&distribution_id) {
             if pending_map.contains_key(&distribution_id) {
-                warn!("distribution {}: trying to move already pending distribution", distribution_id);
+                warn!("Distribution {}: trying to move already pending distribution", distribution_id);
             } else if !self.distribution.contains_key(&distribution_id) {
-                warn!("distribution {}: trying to move non-exist(all connections was closed) distribution", distribution_id);
+                warn!("Distribution {}: trying to move non-exist(all connections was closed) distribution", distribution_id);
             }
             return;
         }
@@ -259,14 +295,14 @@ impl ProxyServer {
         }
         drop(conns);
 
-        info!("distribution {}: moving {} connections", distribution_id, moving_connections.len());
+        info!("Distribution {}: moving {} connections", distribution_id, moving_connections.len());
 
         let proxy_server = self.clone();
         let d_id = distribution_id.clone();
         let (fut, handle) = abortable(async move {
             delay_for(Duration::from_secs(20)).await;
 
-            warn!("distribution {}: move timeout! {} connections left",
+            warn!("Distribution {}: move timeout! {} connections left",
                   d_id,
                   proxy_server.pending_moves.lock().await.get(&d_id)
                       .map(|v| v.pending_count).unwrap_or(0)
@@ -295,7 +331,6 @@ impl ProxyServer {
     }
 
     async fn pending_done(&self, distribution_id: &str) {
-
         if let Some(d) = self.distribution.get(distribution_id) {
             for conn in d.value() {
                 conn.client_sender.clone()
