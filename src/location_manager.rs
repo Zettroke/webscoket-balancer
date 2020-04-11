@@ -2,15 +2,13 @@ use tokio::sync::RwLock;
 use std::sync::Arc;
 use crate::websocket::WebsocketData;
 use tokio::net::TcpStream;
-use bytes::{BufMut, Buf, BytesMut};
-use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncWrite};
+use bytes::{BufMut, Buf};
+use tokio::io::{AsyncWriteExt, AsyncRead, AsyncWrite};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering, AtomicBool};
 use tokio::sync::broadcast;
-use thiserror::Error;
-use futures::io::ErrorKind;
 use futures::task::{Context, Poll};
 use tokio::macros::support::Pin;
 use std::mem::MaybeUninit;
@@ -148,7 +146,7 @@ impl ProxyLocation {
     }
 
     pub async fn get_plain_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TcpStream, HandshakeError> {
-        let mut socket = TcpStream::connect(self.address.clone()).await?;
+        let socket = TcpStream::connect(self.address.clone()).await?;
 
         self.connect(socket, data).await
     }
@@ -241,7 +239,7 @@ impl LocationManager {
         loc.dead.store(true, Ordering::Release);
 
         // remove all distributions linked to dead location
-        self.distributions.retain(|k, v| v.id != loc.id);
+        self.distributions.retain(|_k, v| v.id != loc.id);
     }
 
     async fn find_best_location(&self) -> Option<Arc<ProxyLocation>> {

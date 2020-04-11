@@ -10,10 +10,8 @@ use futures::future::abortable;
 use tokio::select;
 use std::pin::Pin;
 use std::fmt::{Debug, Formatter};
-use std::borrow::Borrow;
-use tokio::net::tcp::{WriteHalf, ReadHalf};
 use std::collections::HashMap;
-use crate::location_manager::{LocationManager, LocationManagerMessage, SocketWrapper, ProxyLocation};
+use crate::location_manager::{LocationManager, LocationManagerMessage, ProxyLocation};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry::Occupied;
 use std::ops::Deref;
@@ -21,19 +19,14 @@ use rand::Rng;
 use crate::websocket_util::{MessageError, HandshakeError};
 use crate::message::{RawMessage, MessageOpCode};
 use tokio::io::{AsyncWrite, AsyncRead};
-use tokio::net::TcpStream;
-use std::sync::atomic::Ordering;
-
-// #[derive(Error)]
-// pub enum LocationWebsocketError {
-//
-// }
+use std::sync::atomic::{Ordering, AtomicBool};
 
 pub struct WsConnection {
     data: Arc<WebsocketData>,
     abort_handle: AbortHandle,
     // channels: oneshot::Receiver<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>
-    client_sender: mpsc::Sender<RawMessage>
+    client_sender: mpsc::Sender<RawMessage>,
+    is_moving: Arc<AtomicBool>
 }
 
 impl Debug for WsConnection {
@@ -50,13 +43,11 @@ impl WsConnection {
         loop {
             match recv.recv().await {
                 Some(msg) => {
-                    //println!("Proxiyng msg {:?}", msg);
                     if let Some(msg) = client_msg_handler.handle(msg) {
                         crate::websocket_util::send_message(msg, &mut write).await?;
                     }
                 },
                 None => {
-                    // println!("Stopped");
                     return Ok(());
                 }
             }
@@ -68,7 +59,9 @@ impl WsConnection {
             match crate::websocket_util::receive_message(&mut read).await {
                 Ok(msg) => {
                     match send.send(msg).await {
-                        Err(_) => return Ok(()),
+                        Err(_) => {
+                            return Ok(())
+                        },
                         _ => {}
                     }
                 },
@@ -174,7 +167,7 @@ impl ProxyServer {
         where Ret: Future<Output=Result<T, HandshakeError>>
     {
         let mut retries = 5u32;
-        let mut socket: T = loop {
+        let socket: T = loop {
             match Box::pin((f)(loc, data)).await {
                 Ok(s) => break s,
                 Err(HandshakeError::IOError(e)) => {
@@ -199,7 +192,7 @@ impl ProxyServer {
         Ok(socket)
     }
 
-    async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, mut recv: mpsc::Receiver<RawMessage>, mut send: mpsc::Sender<RawMessage>) -> Result<(), String> {
+    async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, recv: mpsc::Receiver<RawMessage>, send: mpsc::Sender<RawMessage>) -> Result<(), String> {
         let loc = match self.location_manager.get_location(data.distribution_id.clone()).await {
             Some(loc) => loc,
             None => {
@@ -207,8 +200,6 @@ impl ProxyServer {
                 return Err("Couldn't find proxy location".to_string())
             }
         };
-
-
 
         if loc.secure {
             let socket = self.try_get_connection(ProxyLocation::get_secure_connection, &loc, data.deref()).await?;
@@ -231,11 +222,10 @@ impl ProxyServer {
         loc: Arc<ProxyLocation>,
         mut recv: mpsc::Receiver<RawMessage>,
         mut send: mpsc::Sender<RawMessage>
-    )
-    where S: AsyncRead + AsyncWrite + Unpin
-    {
+    ) where S: AsyncRead + AsyncWrite + Unpin {
+
         let (r, w) = tokio::io::split(socket);
-        // println!("ProxyServer websocket_created");
+
         let cml = ControlMessageListener {
             data: data.clone(),
             server: self.clone()
@@ -247,11 +237,15 @@ impl ProxyServer {
                     d = WsConnection::receive_loop(r, &mut send) => {d}
                 }
         });
+
+        let is_moving = Arc::new(AtomicBool::new(false));
         let ws_conn = WsConnection {
             data: data.clone(),
             abort_handle: handle,
-            client_sender: send_clone
+            client_sender: send_clone,
+            is_moving: is_moving.clone()
         };
+
         self.distribution
             .entry(data.distribution_id.clone())
             .or_insert_with(|| vec![])
@@ -260,11 +254,13 @@ impl ProxyServer {
 
         info!("Websocket {} disconnected from location {}", data.id, loc.address);
         loc.connection_count.fetch_sub(1, Ordering::Relaxed);
-        if let Occupied(mut entry) = self.distribution.entry(data.distribution_id.clone()) {
-            let conns = entry.get_mut();
-            conns.iter().position(|v| v.data.id == data.id).map(|ind| conns.remove(ind));
-            if conns.len() == 0 {
-                entry.remove();
+        if !is_moving.load(Ordering::Acquire) {
+            if let Occupied(mut entry) = self.distribution.entry(data.distribution_id.clone()) {
+                let conns = entry.get_mut();
+                conns.iter().position(|v| v.data.id == data.id).map(|ind| conns.remove(ind));
+                if conns.len() == 0 {
+                    entry.remove();
+                }
             }
         }
     }
@@ -288,7 +284,9 @@ impl ProxyServer {
         let mut i = 0;
         while i < conns.len() {
             if conns[i].data.distribution_id == distribution_id {
-                moving_connections.push(conns.remove(i));
+                let c = conns.remove(i);
+                c.is_moving.store(true, Ordering::Release);
+                moving_connections.push(c);
             } else {
                 i += 1
             }
@@ -393,7 +391,7 @@ impl ProxyServerBuilder {
         self
     }
     
-    pub fn build(mut self) -> Arc<ProxyServer> {
+    pub fn build(self) -> Arc<ProxyServer> {
         Arc::new(ProxyServer {
             location_manager: self.lm.expect("You should set location_manager"),
             move_start_message: self.move_start_message,

@@ -1,13 +1,11 @@
 extern crate memchr;
 use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, Ipv4Addr, Shutdown};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use std::collections::HashMap;
-use memchr::memchr;
 use crypto::sha1::Sha1;
 use crypto::digest::Digest;
-use thiserror::Error;
 use tokio::select;
 use tokio::sync::{mpsc, RwLock, RwLockReadGuard};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
@@ -116,7 +114,12 @@ impl WebsocketServerInner {
 
             match fut.await {
                 Err(_) => {
-                    crate::websocket_util::send_message(RawMessage::close_message(), &mut socket).await;
+                    match crate::websocket_util::send_message(RawMessage::close_message(), &mut socket).await {
+                        Err(e) => {
+                            warn!("Can't send close message to client {} err: {:?}", data.id, e);
+                        }
+                        _ => {}
+                    };
                 },
                 Ok(_) => {}
             }

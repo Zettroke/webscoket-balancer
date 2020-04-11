@@ -102,7 +102,7 @@ pub async fn send_message<T: AsyncWrite + Unpin>(msg: RawMessage, writer: &mut T
 }
 
 pub async fn receive_handshake_data<T: AsyncRead + Unpin>(socket: &mut T) -> Result<WebsocketData, HandshakeError> {
-    let mut handshake: Vec<u8> = read_headers(socket).await?;
+    let handshake: Vec<u8> = read_headers(socket).await?;
     let mut headers = [httparse::EMPTY_HEADER; 30];
 
     let mut req = httparse::Request::new(&mut headers);

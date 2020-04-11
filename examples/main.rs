@@ -1,12 +1,12 @@
 use websocket_balancer::kappa;
-use websocket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection, WebsocketData};
-use websocket_balancer::proxy::{ProxyServer, ProxyServerBuilder};
+use websocket_balancer::websocket::{WebsocketServerBuilder, WebsocketConnection};
+use websocket_balancer::proxy::ProxyServerBuilder;
 use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
 use websocket_balancer::location_manager::{LocationManager, ProxyLocation};
 use std::sync::atomic::Ordering;
 
-#[macro_use] extern crate log;
+// #[macro_use] extern crate log;
 
 #[tokio::main]
 async fn main() {
@@ -32,7 +32,7 @@ async fn main() {
         .address("127.0.0.1:1337")
         .channel(ps.get_channel())
         .build();
-    let ss = s.clone();
+    let _ss = s.clone();
     tokio::spawn(async move {
         loop {
             let mut v = String::new();
