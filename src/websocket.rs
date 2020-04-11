@@ -17,7 +17,7 @@ use crate::websocket_util::{MessageError, HandshakeError};
 
 pub static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct WebsocketData {
     pub id: String,
     pub path: String,
@@ -71,7 +71,7 @@ impl WebsocketConnection {
     }
 }
 
-pub struct WebsocketServerInner {
+pub struct WebsocketServer {
     addr: SocketAddr,
     connections: RwLock<Vec<WebsocketConnection>>,
     channel: Box<dyn ServerChannel + Send + Sync>,
@@ -79,8 +79,8 @@ pub struct WebsocketServerInner {
     dist_fn: WSfn
 }
 
-impl WebsocketServerInner {
-    async fn handler(self: Arc<WebsocketServerInner>, mut socket: TcpStream) {
+impl WebsocketServer {
+    async fn handler(self: Arc<WebsocketServer>, mut socket: TcpStream) {
 
         //TODO: Разделить handshake, и если websocket_created вернет Err, то возвращать http ответ с ошибкой.
         let data: Arc<WebsocketData> = Arc::new(Box::pin(self.handshake(&mut socket)).await.unwrap());
@@ -179,14 +179,14 @@ impl WebsocketServerInner {
         Ok(data)
     }
 
-    pub async fn run(self: Arc<WebsocketServerInner>) {
+    pub async fn run(self: Arc<WebsocketServer>) {
         let serv = self.clone();
 
         let (fut, _handle) = abortable(async move {
             let mut l = TcpListener::bind(serv.addr).await.unwrap();
             loop {
                 let (sock, _addr) = l.accept().await.unwrap();
-                let task  = WebsocketServerInner::handler(serv.clone(), sock);
+                let task  = WebsocketServer::handler(serv.clone(), sock);
                 // debug!("server future size: {}", get_size(&task));
                 tokio::spawn(task);
             }
@@ -245,8 +245,8 @@ impl WebsocketServerBuilder {
         self
     }
 
-    pub fn build(self) -> Arc<WebsocketServerInner> {
-        Arc::new(WebsocketServerInner {
+    pub fn build(self) -> Arc<WebsocketServer> {
+        Arc::new(WebsocketServer {
             connections: RwLock::new(Vec::new()),
             channel: self.channel.unwrap(),
             addr: self.addr,

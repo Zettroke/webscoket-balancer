@@ -14,12 +14,13 @@ use tokio::macros::support::Pin;
 use std::mem::MaybeUninit;
 use crate::websocket_util::HandshakeError;
 use tokio_tls::TlsStream;
+use dashmap::mapref::one::Ref;
 
 #[derive(Debug, Builder)]
 pub struct ProxyLocation {
     #[builder(setter(skip))]
     #[builder(default)]
-    id: u64,
+    pub id: u64,
     pub address: String,
     #[builder(setter(skip))]
     #[builder(default)]
@@ -207,7 +208,7 @@ impl LocationManager {
         Some(())
     }
 
-    pub async fn get_location(&self, distribution_id: String) -> Option<Arc<ProxyLocation>> {
+    pub(crate) async fn find_location(&self, distribution_id: String) -> Option<Arc<ProxyLocation>> {
         let entry = self.distributions.entry(distribution_id);
         let loc = match entry {
             Entry::Occupied(e) => {
@@ -221,6 +222,10 @@ impl LocationManager {
         };
 
         Some(loc)
+    }
+
+    pub fn get_location_ref(&self, distribution_id: &str) -> Option<Ref<String, Arc<ProxyLocation>>> {
+        self.distributions.get(distribution_id)
     }
 
     pub async fn add_location(&self, mut loc: ProxyLocation) {

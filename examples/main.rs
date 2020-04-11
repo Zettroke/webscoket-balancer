@@ -32,7 +32,7 @@ async fn main() {
         .address("127.0.0.1:1337")
         .channel(ps.get_channel())
         .build();
-    let _ss = s.clone();
+    let ss = s.clone();
     tokio::spawn(async move {
         loop {
             let mut v = String::new();
@@ -99,8 +99,6 @@ async fn main() {
             }
         }
     });
-    // debug!("RawMessage size: {}", std::mem::size_of::<RawMessage>());
-    // debug!("WebsocketData size: {}", std::mem::size_of::<WebsocketData>());
     ss.run().await;
     println!("{}", kappa());
 

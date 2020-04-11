@@ -193,7 +193,7 @@ impl ProxyServer {
     }
 
     async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, recv: mpsc::Receiver<RawMessage>, send: mpsc::Sender<RawMessage>) -> Result<(), String> {
-        let loc = match self.location_manager.get_location(data.distribution_id.clone()).await {
+        let loc = match self.location_manager.find_location(data.distribution_id.clone()).await {
             Some(loc) => loc,
             None => {
                 error!("Couldn't find proxy location");
