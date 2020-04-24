@@ -15,6 +15,7 @@ use std::mem::MaybeUninit;
 use crate::websocket_util::HandshakeError;
 use tokio_tls::TlsStream;
 use dashmap::mapref::one::Ref;
+use tokio::time::{timeout_at, Instant, Duration};
 
 #[derive(Debug, Builder)]
 pub struct ProxyLocation {
@@ -47,64 +48,6 @@ impl Default for ProxyLocation {
         }
     }
 }
-
-
-pub struct SocketWrapper<T: AsyncRead + AsyncWrite + Unpin> {
-    loc: Arc<ProxyLocation>,
-    inner: T
-}
-impl<T: AsyncRead + AsyncWrite + Unpin> Deref for SocketWrapper<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-impl<T: AsyncRead + AsyncWrite + Unpin> DerefMut for SocketWrapper<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-impl<T: AsyncRead + AsyncWrite + Unpin> Drop for SocketWrapper<T> {
-    fn drop(&mut self) {
-        self.loc.connection_count.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-impl<T: tokio::io::AsyncRead + AsyncWrite + Unpin> AsyncRead for SocketWrapper<T> {
-    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [MaybeUninit<u8>]) -> bool {
-        self.inner.prepare_uninitialized_buffer(buf)
-    }
-
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-
-    fn poll_read_buf<B: BufMut>(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<std::io::Result<usize>> where
-        Self: Sized, {
-        Pin::new(&mut self.inner).poll_read_buf(cx, buf)
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SocketWrapper<T> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn poll_write_buf<B: Buf>(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<std::io::Result<usize>> where
-        Self: Sized, {
-        Pin::new(&mut self.inner).poll_write_buf(cx, buf)
-    }
-}
-
 
 impl ProxyLocation {
     pub fn new() -> ProxyLocationBuilder {
@@ -180,7 +123,7 @@ pub enum LocationManagerMessage {
 pub struct LocationManager {
     channel: broadcast::Sender<LocationManagerMessage>,
     pub locations: RwLock<Vec<Arc<ProxyLocation>>>,
-    distributions: DashMap<String, Arc<ProxyLocation>>
+    pub distributions: DashMap<String, Arc<ProxyLocation>>
 }
 
 impl LocationManager {
@@ -230,8 +173,9 @@ impl LocationManager {
 
     pub async fn add_location(&self, mut loc: ProxyLocation) {
         let mut loc_list = self.locations.write().await;
-        while loc_list.iter().any(|v| v.id == loc.id) {
+        loop {
             loc.id = rand::random();
+            if !loc_list.iter().any(|v| v.id == loc.id) { break; }
         }
         loc_list.push(Arc::new(loc));
     }
@@ -242,8 +186,9 @@ impl LocationManager {
 
     pub async fn mark_dead(&self, loc: &ProxyLocation) {
         loc.dead.store(true, Ordering::Release);
+        error!("Location {} is dead!", loc.address);
 
-        // remove all distributions linked to dead location
+        // remove all distributions linked to the dead location
         self.distributions.retain(|_k, v| v.id != loc.id);
     }
 

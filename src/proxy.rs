@@ -5,7 +5,7 @@ use crate::websocket::WebsocketData;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use futures::future::AbortHandle;
-use tokio::time::{delay_for, Duration};
+use tokio::time::{delay_for, Duration, timeout_at, Instant};
 use futures::future::abortable;
 use tokio::select;
 use std::pin::Pin;
@@ -22,7 +22,7 @@ use tokio::io::{AsyncWrite, AsyncRead};
 use std::sync::atomic::{Ordering, AtomicBool};
 
 pub struct WsConnection {
-    data: Arc<WebsocketData>,
+    pub data: Arc<WebsocketData>,
     abort_handle: AbortHandle,
     // channels: oneshot::Receiver<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>
     client_sender: mpsc::Sender<RawMessage>,
@@ -168,20 +168,32 @@ impl ProxyServer {
     {
         let mut retries = 5u32;
         let socket: T = loop {
-            match Box::pin((f)(loc, data)).await {
-                Ok(s) => break s,
-                Err(HandshakeError::IOError(e)) => {
+            let fut = timeout_at(
+                Instant::now() + Duration::from_millis(500),
+                Box::pin((f)(loc, data))
+            );
+            let res: Result<T, HandshakeError> = match fut.await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(HandshakeError::Timeout)
+            };
+
+            match res {
+                Err(e @ HandshakeError::Timeout) | Err(e @ HandshakeError::IOError(_)) => {
                     if retries == 0 {
                         self.location_manager.mark_dead(loc).await;
                         // TODO: keep trying new locations
-                        error!("{:?} Couldn't connect to location {:?}",e , loc);
-                        return Err("Kappa".to_string());
+                        error!("{:?} Couldn't connect to location {:?}", e, loc);
+                        return Err(format!("{}", e));
                     } else {
-                        debug!("retrying, retries left: {}", retries);
+                        debug!("retrying connecting {:?}, retries left: {}", loc, retries);
                         retries -= 1;
                         let t = rand::thread_rng().gen_range(1, 200);
                         delay_for(Duration::from_millis(t)).await;
                     }
+                },
+                Ok(v) => {
+                    break v
                 },
                 Err(e) => {
                     return Err(format!("{}", e));

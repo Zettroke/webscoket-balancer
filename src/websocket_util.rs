@@ -32,7 +32,9 @@ pub enum HandshakeError {
     #[error("IO error happened: {0:?}")]
     IOError(#[from] std::io::Error),
     #[error("TLS error: {0:?}")]
-    TlsError(#[from] native_tls::Error)
+    TlsError(#[from] native_tls::Error),
+    #[error("Connection to proxy timeout")]
+    Timeout,
 }
 
 pub async fn receive_message<T: AsyncReadExt + Unpin>(reader: &mut T) -> Result<RawMessage, MessageError> {
