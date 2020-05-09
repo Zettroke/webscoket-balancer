@@ -14,6 +14,8 @@ use std::fmt::{Debug, Formatter};
 use crate::ServerChannel;
 use crate::message::{RawMessage, MessageOpCode};
 use crate::websocket_util::{MessageError, HandshakeError};
+use futures::{SinkExt, StreamExt};
+use http::{Request, Response};
 
 pub static MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MB
 
@@ -81,16 +83,29 @@ pub struct WebsocketServer {
 
 impl WebsocketServer {
     async fn handler(self: Arc<WebsocketServer>, mut socket: TcpStream) {
-
+        let s = tokio_tungstenite::accept_hdr_async(
+            socket,
+            |req: &Request<()>, resp: Response<()>| {
+                if let Some(q) = req.uri().query() {
+                    for param in q.split('&') {
+                        param.split('=')
+                    }
+                }
+                Ok(resp)
+            }
+        ).await.unwrap();
+        let (w, r) = s.split();
         //TODO: Разделить handshake, и если websocket_created вернет Err, то возвращать http ответ с ошибкой.
-        let data: Arc<WebsocketData> = Arc::new(Box::pin(self.handshake(&mut socket)).await.unwrap());
 
-        // receive pair
-        let (tx, rx) = mpsc::channel::<RawMessage>(5);
-        // send pair
-        let (tx2, rx2) = mpsc::channel::<RawMessage>(5);
+        //let data: Arc<WebsocketData> = Arc::new(Box::pin(self.handshake(&mut socket)).await.unwrap());
+        let data: Arc<WebsocketData> = Arc::new(WebsocketData::default());
 
-        match self.channel.websocket_created(data.clone(), rx, tx2).await {
+        // // receive pair
+        // let (tx, rx) = mpsc::channel::<RawMessage>(5);
+        // // send pair
+        // let (tx2, rx2) = mpsc::channel::<RawMessage>(5);
+
+        match self.channel.websocket_created(data.clone(), r, w).await {
             Ok(_) => {},
             Err(e) => {
                 error!("{:?}", e);

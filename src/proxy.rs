@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use crate::ServerChannel;
-use futures::Future;
+use futures::{Future, Stream, Sink, StreamExt};
 use crate::websocket::WebsocketData;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -20,6 +20,8 @@ use crate::websocket_util::{MessageError, HandshakeError};
 use crate::message::{RawMessage, MessageOpCode};
 use tokio::io::{AsyncWrite, AsyncRead};
 use std::sync::atomic::{Ordering, AtomicBool};
+use tungstenite::{Message, Error};
+use tokio_tungstenite::WebSocketStream;
 
 pub struct WsConnection {
     pub data: Arc<WebsocketData>,
@@ -204,7 +206,9 @@ impl ProxyServer {
         Ok(socket)
     }
 
-    async fn websocket_created(self: Arc<ProxyServer>, data: Arc<WebsocketData>, recv: mpsc::Receiver<RawMessage>, send: mpsc::Sender<RawMessage>) -> Result<(), String> {
+    async fn websocket_created<S, W>(self: Arc<ProxyServer>, data: Arc<WebsocketData>, recv: S, send: W) -> Result<(), WsError>
+        where S: Stream<Item=Result<Message, WsError>>, W: Sink<Message>
+    {
         let loc = match self.location_manager.find_location(data.distribution_id.clone()).await {
             Some(loc) => loc,
             None => {
@@ -213,29 +217,34 @@ impl ProxyServer {
             }
         };
 
+        // let v = tokio_tungstenite::client_async_tls(loc.uri.clone(), loc.get_plain_connection(&data)).await;
+        // tokio_tungstenite::client_async(loc.uri.clone());
         if loc.secure {
             let socket = self.try_get_connection(ProxyLocation::get_secure_connection, &loc, data.deref()).await?;
             info!("Proxying websocket {} to location {}", data.id, loc.address);
-            tokio::spawn(self.handler(socket, data, loc, recv, send));
+            let r = tokio_tungstenite::client_async(loc.uri.clone(), socket).await?.0;
+            tokio::spawn(self.handler(r, data, loc, recv, send));
         } else {
             let socket= self.try_get_connection(ProxyLocation::get_plain_connection, &loc, data.deref()).await?;
             info!("Proxying websocket {} to location {}", data.id, loc.address);
-            tokio::spawn(self.handler(socket, data, loc, recv, send));
+            let r = tokio_tungstenite::client_async(loc.uri.clone(), socket).await?.0;
+            tokio::spawn(self.handler(r, data, loc, recv, send));
         }
 
 
         Ok(())
     }
 
-    async fn handler<S>(
+    async fn handler<Sock, S, W>(
         self: Arc<ProxyServer>,
-        socket: S,
+        ws: WebSocketStream<Sock>,
         data: Arc<WebsocketData>,
         loc: Arc<ProxyLocation>,
-        mut recv: mpsc::Receiver<RawMessage>,
-        mut send: mpsc::Sender<RawMessage>
-    ) where S: AsyncRead + AsyncWrite + Unpin {
-
+        mut recv: S,
+        mut send: W
+    ) where S: Stream<Item=Result<Message, WsError>>, W: Sink<Message>
+    {
+        let (w, r) = ws.split();
         let (r, w) = tokio::io::split(socket);
 
         let cml = ControlMessageListener {
@@ -384,12 +393,12 @@ impl ProxyServerBuilder {
             move_end_message: "".to_string()
         }
     }
-    
+
     pub fn location_manager(mut self, lm: Arc<LocationManager>) -> Self {
         self.lm = Some(lm);
         self
     }
-    
+
     pub fn move_start_message(mut self, s: String) -> Self {
         self.move_start_message = s;
         self
@@ -402,7 +411,7 @@ impl ProxyServerBuilder {
         self.move_end_message = s;
         self
     }
-    
+
     pub fn build(self) -> Arc<ProxyServer> {
         Arc::new(ProxyServer {
             location_manager: self.lm.expect("You should set location_manager"),
@@ -420,12 +429,24 @@ pub struct ProxyServerChannel {
 }
 
 impl ServerChannel for ProxyServerChannel {
-    fn websocket_created(&self, data: Arc<WebsocketData>, recv: mpsc::Receiver<RawMessage>, send: mpsc::Sender<RawMessage>) -> Pin<Box<dyn Future<Output=Result<(), String>> + Send>> {
+    fn websocket_created<S, W>(
+        &self,
+        data: Arc<WebsocketData>,
+        stream: S,
+        sink: W) -> Pin<Box<dyn Future<Output=Result<(), Error>> + Send>>
+        where S: Stream<Item=Result<Message, WsError>>, W: Sink<Message> {
         let s = self.server.clone();
         Box::pin(async move {
-            s.websocket_created(data, recv, send).await
+            s.websocket_created(data, stream, sink).await
         })
     }
+
+    // fn websocket_created(&self, data: Arc<WebsocketData>, recv: mpsc::Receiver<RawMessage>, send: mpsc::Sender<RawMessage>) -> Pin<Box<dyn Future<Output=Result<(), String>> + Send>> {
+    //     let s = self.server.clone();
+    //     Box::pin(async move {
+    //         s.websocket_created(data, recv, send).await
+    //     })
+    // }
 
     fn websocket_removed(&self, data: Arc<WebsocketData>) -> Pin<Box<dyn Future<Output=()> + Send>> {
         let s = self.server.clone();

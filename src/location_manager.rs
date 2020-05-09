@@ -22,16 +22,13 @@ pub struct ProxyLocation {
     #[builder(setter(skip))]
     #[builder(default)]
     pub id: u64,
-    pub address: String,
+    pub uri: String,
     #[builder(setter(skip))]
     #[builder(default)]
     pub connection_count: AtomicU32,
     #[builder(setter(skip))]
     #[builder(default)]
     pub dead: AtomicBool,
-    #[builder(setter(strip_option))]
-    #[builder(default)]
-    pub domain: Option<String>,
     #[builder(default)]
     pub secure: bool
 }
@@ -40,10 +37,9 @@ impl Default for ProxyLocation {
     fn default() -> Self {
         ProxyLocation {
             id: rand::random(),
-            address: "127.0.0.1:80".to_string(),
+            uri: "ws://127.0.0.1:80".to_string(),
             connection_count: AtomicU32::new(0),
             dead: AtomicBool::new(false),
-            domain: None,
             secure: false
         }
     }
@@ -92,7 +88,10 @@ impl ProxyLocation {
     pub async fn get_plain_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TcpStream, HandshakeError> {
         let socket = TcpStream::connect(self.address.clone()).await?;
 
-        self.connect(socket, data).await
+        // self.connect(socket, data).await
+        self.connection_count.fetch_add(1, Ordering::Release);
+
+        Ok(socket)
     }
 
     pub async fn get_secure_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TlsStream<TcpStream>, HandshakeError> {
@@ -101,8 +100,9 @@ impl ProxyLocation {
         let cx = tokio_tls::TlsConnector::from(cx);
 
         let tls_socket = cx.connect(self.domain.as_ref().map(|s| s.as_str()).unwrap_or(""), socket).await?;
-
-        self.connect(tls_socket, data).await
+        self.connection_count.fetch_add(1, Ordering::Release);
+        Ok(tls_socket)
+        // self.connect(tls_socket, data).await
     }
 
     async fn connect<T: AsyncRead + AsyncWrite + Unpin>(self:&ProxyLocation, mut socket: T, data: &WebsocketData) -> Result<T, HandshakeError> {
