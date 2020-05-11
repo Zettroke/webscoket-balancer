@@ -1,12 +1,10 @@
 use crate::websocket::WebsocketData;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use futures::Future;
 use std::pin::Pin;
-use crate::message::RawMessage;
 use tokio_tungstenite::WebSocketStream;
 use tokio::net::TcpStream;
-use tungstenite::{Message, Error as WsError};
+use tungstenite::{Message, Error};
 use futures::stream::Stream;
 use futures::sink::Sink;
 
@@ -22,13 +20,17 @@ pub fn kappa() -> u64 {
     1337*1488
 }
 
+pub trait WsMessageStream: Stream<Item=Result<Message, Error>> + Send + Unpin {}
+impl<T: Stream<Item=Result<Message, Error>> + Send + Unpin> WsMessageStream for T {}
+
+pub trait WsMessageSink: Sink<Message, Error=Error> + Send + Unpin {}
+impl<T: Sink<Message, Error=Error> + Send + Unpin> WsMessageSink for T {}
+
 pub trait ServerChannel {
-    fn websocket_created<S, W>(
+    fn websocket_created(
         &self,
         data: Arc<WebsocketData>,
-        stream: S,
-        sink: W) -> Pin<Box<dyn Future<Output=Result<(), WsError>> + Send>>
-        where S: Stream<Item=Result<Message, WsError>>, W: Sink<Message>;
+        ws_stream: WebSocketStream<TcpStream>) -> Pin<Box<dyn Future<Output=Result<(), Error>> + Send>>;
     fn websocket_removed(&self, data: Arc<WebsocketData>) -> Pin<Box<dyn Future<Output=()> + Send>>;
 }
 

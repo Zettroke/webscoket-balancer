@@ -5,6 +5,8 @@ use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
 use websocket_balancer::location_manager::{LocationManager, ProxyLocation};
 use std::sync::atomic::Ordering;
+use http::uri::Uri;
+use std::convert::TryInto;
 
 // #[macro_use] extern crate log;
 
@@ -12,8 +14,9 @@ use std::sync::atomic::Ordering;
 async fn main() {
     env_logger::init();
     let lm = Arc::new(LocationManager::new());
-    lm.add_location(ProxyLocation::new().address("127.0.0.1:13338".to_string()).secure(false).build().unwrap()).await;
-    lm.add_location(ProxyLocation::new().address("127.0.0.1:13339".to_string()).secure(false).build().unwrap()).await;
+    // let uri: Uri = "wss://127.0.0.1:13338".try_into().unwrap();
+    lm.add_location(ProxyLocation::new().uri("wss://127.0.0.1:13338".try_into().unwrap()).secure(false).build().unwrap()).await;
+    lm.add_location(ProxyLocation::new().uri("wss://127.0.0.1:13339".try_into().unwrap()).secure(false).build().unwrap()).await;
     // lm.add_location().await;
     // lm.add_location("127.0.0.1:13339".to_string()).await;
     let lmm = lm.clone();
@@ -62,7 +65,7 @@ async fn main() {
                     let v = lmm.locations.read().await;
                     println!("got 1 lock");
                     for pl in v.iter() {
-                        println!("{:?} got {} connections. dead - {}", pl.address, pl.connection_count.load(Ordering::Relaxed), pl.dead.load(Ordering::Relaxed));
+                        println!("{:?} got {} connections. dead - {}", pl.uri, pl.connection_count.load(Ordering::Relaxed), pl.dead.load(Ordering::Relaxed));
                     }
                 },
                 "proxy" => {

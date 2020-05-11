@@ -16,13 +16,15 @@ use crate::websocket_util::HandshakeError;
 use tokio_tls::TlsStream;
 use dashmap::mapref::one::Ref;
 use tokio::time::{timeout_at, Instant, Duration};
+use http::Uri;
+use std::str::FromStr;
 
 #[derive(Debug, Builder)]
 pub struct ProxyLocation {
     #[builder(setter(skip))]
     #[builder(default)]
     pub id: u64,
-    pub uri: String,
+    pub uri: Uri,
     #[builder(setter(skip))]
     #[builder(default)]
     pub connection_count: AtomicU32,
@@ -37,7 +39,7 @@ impl Default for ProxyLocation {
     fn default() -> Self {
         ProxyLocation {
             id: rand::random(),
-            uri: "ws://127.0.0.1:80".to_string(),
+            uri: Uri::from_str("ws://127.0.0.1:80").unwrap(),
             connection_count: AtomicU32::new(0),
             dead: AtomicBool::new(false),
             secure: false
@@ -50,43 +52,43 @@ impl ProxyLocation {
         ProxyLocationBuilder::default()
     }
 
-    async fn send_handshake<T: AsyncWrite + Unpin>(&self, socket: &mut T, data: &WebsocketData) -> Result<(), HandshakeError> {
-        let mut body = bytes::BytesMut::new();
-        body.put_slice(b"GET ");
-
-        body.put_slice(data.path.as_bytes());
-        if data.query_params.len() > 0 {
-            body.put_u8(b'?');
-            for (ind, (k, v)) in data.query_params.iter().enumerate() {
-                body.put_slice(k.as_bytes());
-                body.put_u8(b'=');
-                body.put_slice(v.as_bytes());
-                if ind != data.query_params.len() - 1 {
-                    body.put_u8(b'&');
-                }
-            }
-        }
-        body.put_slice(b" HTTP/1.1\r\n");
-
-        for (k, v) in data.headers.iter() {
-            if k == "host" {
-                body.put_slice(b"host: ");
-                body.put_slice(self.domain.as_ref().unwrap_or(&self.address).as_bytes());
-                body.put_slice(b"\r\n");
-            } else if k != "sec-websocket-extensions" {
-                body.put_slice(k.as_bytes());
-                body.put_slice(b": ");
-                body.put_slice(v.as_bytes());
-                body.put_slice(b"\r\n");
-            }
-        }
-        body.put_slice(b"\r\n");
-        socket.write_all(body.as_ref()).await?;
-        Ok(())
-    }
+    // async fn send_handshake<T: AsyncWrite + Unpin>(&self, socket: &mut T, data: &WebsocketData) -> Result<(), HandshakeError> {
+    //     let mut body = bytes::BytesMut::new();
+    //     body.put_slice(b"GET ");
+    //
+    //     body.put_slice(data.path.as_bytes());
+    //     if data.query_params.len() > 0 {
+    //         body.put_u8(b'?');
+    //         for (ind, (k, v)) in data.query_params.iter().enumerate() {
+    //             body.put_slice(k.as_bytes());
+    //             body.put_u8(b'=');
+    //             body.put_slice(v.as_bytes());
+    //             if ind != data.query_params.len() - 1 {
+    //                 body.put_u8(b'&');
+    //             }
+    //         }
+    //     }
+    //     body.put_slice(b" HTTP/1.1\r\n");
+    //
+    //     for (k, v) in data.headers.iter() {
+    //         if k == "host" {
+    //             body.put_slice(b"host: ");
+    //             body.put_slice(self.domain.as_ref().unwrap_or(&self.address).as_bytes());
+    //             body.put_slice(b"\r\n");
+    //         } else if k != "sec-websocket-extensions" {
+    //             body.put_slice(k.as_bytes());
+    //             body.put_slice(b": ");
+    //             body.put_slice(v.as_bytes());
+    //             body.put_slice(b"\r\n");
+    //         }
+    //     }
+    //     body.put_slice(b"\r\n");
+    //     socket.write_all(body.as_ref()).await?;
+    //     Ok(())
+    // }
 
     pub async fn get_plain_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TcpStream, HandshakeError> {
-        let socket = TcpStream::connect(self.address.clone()).await?;
+        let socket = TcpStream::connect(self.uri.authority().map(|a| a.as_str()).unwrap_or("")).await?;
 
         // self.connect(socket, data).await
         self.connection_count.fetch_add(1, Ordering::Release);
@@ -95,24 +97,23 @@ impl ProxyLocation {
     }
 
     pub async fn get_secure_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TlsStream<TcpStream>, HandshakeError> {
-        let socket = TcpStream::connect(self.address.as_str()).await?;
+        let socket = TcpStream::connect(self.uri.authority().unwrap().as_str()).await?;
         let cx = native_tls::TlsConnector::builder().build()?;
         let cx = tokio_tls::TlsConnector::from(cx);
 
-        let tls_socket = cx.connect(self.domain.as_ref().map(|s| s.as_str()).unwrap_or(""), socket).await?;
+        let tls_socket = cx.connect(self.uri.host().unwrap_or(""), socket).await?;
         self.connection_count.fetch_add(1, Ordering::Release);
         Ok(tls_socket)
-        // self.connect(tls_socket, data).await
     }
 
-    async fn connect<T: AsyncRead + AsyncWrite + Unpin>(self:&ProxyLocation, mut socket: T, data: &WebsocketData) -> Result<T, HandshakeError> {
-        self.send_handshake(&mut socket, data).await?;
-
-        let _v = crate::websocket_util::read_headers(&mut socket).await?;
-
-        self.connection_count.fetch_add(1, Ordering::Release);
-        Ok(socket)
-    }
+    // async fn connect<T: AsyncRead + AsyncWrite + Unpin>(self:&ProxyLocation, mut socket: T, data: &WebsocketData) -> Result<T, HandshakeError> {
+    //     self.send_handshake(&mut socket, data).await?;
+    //
+    //     let _v = crate::websocket_util::read_headers(&mut socket).await?;
+    //
+    //     self.connection_count.fetch_add(1, Ordering::Release);
+    //     Ok(socket)
+    // }
 }
 
 #[derive(Clone)]
@@ -186,7 +187,7 @@ impl LocationManager {
 
     pub async fn mark_dead(&self, loc: &ProxyLocation) {
         loc.dead.store(true, Ordering::Release);
-        error!("Location {} is dead!", loc.address);
+        error!("Location {} is dead!", loc.uri);
 
         // remove all distributions linked to the dead location
         self.distributions.retain(|_k, v| v.id != loc.id);

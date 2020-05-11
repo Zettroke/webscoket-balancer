@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use crate::ServerChannel;
-use futures::{Future, Stream, Sink, StreamExt};
+use crate::{ServerChannel, WsMessageStream, WsMessageSink};
+use futures::{Future, Stream, Sink, StreamExt, SinkExt};
 use crate::websocket::WebsocketData;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -20,14 +20,15 @@ use crate::websocket_util::{MessageError, HandshakeError};
 use crate::message::{RawMessage, MessageOpCode};
 use tokio::io::{AsyncWrite, AsyncRead};
 use std::sync::atomic::{Ordering, AtomicBool};
-use tungstenite::{Message, Error};
+use tungstenite::{Message, Error as WsError};
 use tokio_tungstenite::WebSocketStream;
+use tokio::net::TcpStream;
 
 pub struct WsConnection {
     pub data: Arc<WebsocketData>,
     abort_handle: AbortHandle,
     // channels: oneshot::Receiver<(mpsc::Receiver<RawMessage>, mpsc::Sender<RawMessage>)>
-    client_sender: mpsc::Sender<RawMessage>,
+    client_sender: mpsc::Sender<Message>,
     is_moving: Arc<AtomicBool>
 }
 
@@ -40,37 +41,34 @@ impl Debug for WsConnection {
 }
 
 impl WsConnection {
-    async fn send_loop<W: AsyncWrite + Unpin, T: MessageListener>(mut write: W, recv: &mut mpsc::Receiver<RawMessage>, client_msg_handler: T) -> std::io::Result<()> {
-        // println!("send_loop");
+    /// Sends messages from client to server
+    async fn send_loop<R: WsMessageStream, W: Sink<Message, Error=WsError> + Send + Unpin, ML: MessageListener>(mut recv: R, mut send: W, client_msg_handler: ML) -> Result<(), WsError> {
         loop {
-            match recv.recv().await {
+            match recv.next().await {
                 Some(msg) => {
-                    if let Some(msg) = client_msg_handler.handle(msg) {
-                        crate::websocket_util::send_message(msg, &mut write).await?;
+                    if let Ok(msg) = msg {
+                        if let Some(msg) = client_msg_handler.handle(msg) {
+                            send.send(msg).await?
+                        }
                     }
                 },
                 None => {
-                    return Ok(());
+                    return Ok(())
                 }
             }
         }
     }
 
-    async fn receive_loop<R: AsyncRead + Unpin>(mut read: R, send: &mut mpsc::Sender<RawMessage>) -> std::io::Result<()> {
+    /// Sends messages from server to client
+    async fn receive_loop<R: WsMessageStream, W: Sink<Message, Error=WsError> + Send + Unpin>(mut recv: R, mut send: W, channel: mpsc::Receiver<Message>) -> Result<(), WsError> {
         loop {
-            match crate::websocket_util::receive_message(&mut read).await {
-                Ok(msg) => {
-                    match send.send(msg).await {
-                        Err(_) => {
-                            return Ok(())
-                        },
-                        _ => {}
+            match recv.next().await {
+                Some(msg) => {
+                    if let Ok(msg) = msg {
+                        send.send(msg).await?
                     }
                 },
-                Err(MessageError::Socket(e)) => {
-                    return Err(e);
-                },
-                Err(_) => {
+                None => {
                     return Ok(());
                 }
             }
@@ -96,7 +94,7 @@ pub struct ProxyServer {
 }
 
 pub trait MessageListener {
-    fn handle(&self, msg: RawMessage) -> Option<RawMessage>;
+    fn handle(&self, msg: Message) -> Option<Message>;
 }
 
 struct ControlMessageListener {
@@ -105,35 +103,34 @@ struct ControlMessageListener {
 }
 
 impl MessageListener for ControlMessageListener {
-    fn handle(&self, mut msg: RawMessage) -> Option<RawMessage> {
-        //let v = &b"WSPROXY_MOVE_DONE"[..];
-        let v = self.server.move_done_message.as_bytes();
-        if msg.payload.len() == v.len() {
-            msg.unmask();
-            if msg.payload.as_slice() == v {
-                info!("Websocket {} move done!", self.data.id);
-                let server = self.server.clone();
-                let data = self.data.clone();
-                tokio::spawn(async move {
-                    let mut done = false;
-                    if let Some(pm) = server.pending_moves.lock().await.get_mut(&data.distribution_id) {
-                        pm.pending_count -= 1;
-                        if pm.pending_count == 0 {
-                            done = true;
-                            info!("Distribution {}: all {} connections successfully moved", data.distribution_id, pm.old_connections.len());
-                        }
-                    } else {
-
+    fn handle(&self, mut msg: Message) -> Option<Message> {
+        if msg.is_text() {
+            match msg.to_text() {
+                Ok(v) => {
+                    if v == self.server.move_done_message.as_str() {
+                        let server = self.server.clone();
+                        let data = self.data.clone();
+                        tokio::spawn(async move {
+                            let mut done = false;
+                            if let Some(pm) = server.pending_moves.lock().await.get_mut(&data.distribution_id) {
+                                pm.pending_count -= 1;
+                                if pm.pending_count == 0 {
+                                    done = true;
+                                    info!("Distribution {}: all {} connections successfully moved", data.distribution_id, pm.old_connections.len());
+                                }
+                            } else {}
+                            if done {
+                                server.pending_done(&data.distribution_id).await;
+                            }
+                        });
+                        return None;
                     }
-                    if done {
-                        server.pending_done(&data.distribution_id).await;
-                    }
-                });
-
-                return None;
+                },
+                Err(_) => {
+                    return Some(msg);
+                }
             }
         }
-
         Some(msg)
     }
 }
@@ -207,26 +204,26 @@ impl ProxyServer {
     }
 
     async fn websocket_created<S, W>(self: Arc<ProxyServer>, data: Arc<WebsocketData>, recv: S, send: W) -> Result<(), WsError>
-        where S: Stream<Item=Result<Message, WsError>>, W: Sink<Message>
+        where S: WsMessageStream + 'static, W: WsMessageSink + 'static
     {
         let loc = match self.location_manager.find_location(data.distribution_id.clone()).await {
             Some(loc) => loc,
             None => {
                 error!("Couldn't find proxy location");
-                return Err("Couldn't find proxy location".to_string())
+                return Ok(())
             }
         };
 
         // let v = tokio_tungstenite::client_async_tls(loc.uri.clone(), loc.get_plain_connection(&data)).await;
         // tokio_tungstenite::client_async(loc.uri.clone());
         if loc.secure {
-            let socket = self.try_get_connection(ProxyLocation::get_secure_connection, &loc, data.deref()).await?;
-            info!("Proxying websocket {} to location {}", data.id, loc.address);
+            let socket = self.try_get_connection(ProxyLocation::get_secure_connection, &loc, data.deref()).await.unwrap();
+            info!("Proxying websocket {} to location {}", data.id, loc.uri);
             let r = tokio_tungstenite::client_async(loc.uri.clone(), socket).await?.0;
             tokio::spawn(self.handler(r, data, loc, recv, send));
         } else {
-            let socket= self.try_get_connection(ProxyLocation::get_plain_connection, &loc, data.deref()).await?;
-            info!("Proxying websocket {} to location {}", data.id, loc.address);
+            let socket= self.try_get_connection(ProxyLocation::get_plain_connection, &loc, data.deref()).await.unwrap();
+            info!("Proxying websocket {} to location {}", data.id, loc.uri);
             let r = tokio_tungstenite::client_async(loc.uri.clone(), socket).await?.0;
             tokio::spawn(self.handler(r, data, loc, recv, send));
         }
@@ -242,20 +239,18 @@ impl ProxyServer {
         loc: Arc<ProxyLocation>,
         mut recv: S,
         mut send: W
-    ) where S: Stream<Item=Result<Message, WsError>>, W: Sink<Message>
+    ) where S: WsMessageStream + 'static, W: WsMessageSink + 'static, Sock: AsyncRead + AsyncWrite + Send + Unpin
     {
         let (w, r) = ws.split();
-        let (r, w) = tokio::io::split(socket);
-
+        let (ch_send, ch_recv) = tokio::sync::mpsc::channel(1);
         let cml = ControlMessageListener {
             data: data.clone(),
             server: self.clone()
         };
-        let send_clone = send.clone();
         let (fut, handle) = abortable(async {
             select! {
-                    d = WsConnection::send_loop(w, &mut recv, cml) => {d}
-                    d = WsConnection::receive_loop(r, &mut send) => {d}
+                    d = WsConnection::send_loop(recv, w, cml) => { d }
+                    d = WsConnection::receive_loop(r, send, ch_recv) => { d }
                 }
         });
 
@@ -263,7 +258,7 @@ impl ProxyServer {
         let ws_conn = WsConnection {
             data: data.clone(),
             abort_handle: handle,
-            client_sender: send_clone,
+            client_sender: ch_send,
             is_moving: is_moving.clone()
         };
 
@@ -273,7 +268,7 @@ impl ProxyServer {
             .push(ws_conn);
         let _ = fut.await;
 
-        info!("Websocket {} disconnected from location {}", data.id, loc.address);
+        info!("Websocket {} disconnected from location {}", data.id, loc.uri);
         loc.connection_count.fetch_sub(1, Ordering::Relaxed);
         if !is_moving.load(Ordering::Acquire) {
             if let Occupied(mut entry) = self.distribution.entry(data.distribution_id.clone()) {
@@ -329,13 +324,9 @@ impl ProxyServer {
             proxy_server.pending_done(&d_id).await;
         });
         for conn in moving_connections.iter_mut() {
-            conn.client_sender.send(RawMessage {
-                fin: true,
-                opcode: MessageOpCode::TextFrame,
-                mask: false,
-                mask_key: [0u8; 4],
-                payload: self.move_start_message.clone().into_bytes()
-            }).await.unwrap();
+            conn.client_sender.send(
+                Message::text(self.move_start_message.clone())
+            ).await.unwrap();
         }
 
         let pm = PendingMove {
@@ -429,14 +420,14 @@ pub struct ProxyServerChannel {
 }
 
 impl ServerChannel for ProxyServerChannel {
-    fn websocket_created<S, W>(
+    fn websocket_created(
         &self,
         data: Arc<WebsocketData>,
-        stream: S,
-        sink: W) -> Pin<Box<dyn Future<Output=Result<(), Error>> + Send>>
-        where S: Stream<Item=Result<Message, WsError>>, W: Sink<Message> {
+        ws_stream: WebSocketStream<TcpStream>) -> Pin<Box<dyn Future<Output=Result<(), WsError>> + Send>>
+    {
         let s = self.server.clone();
         Box::pin(async move {
+            let (sink, stream) = ws_stream.split();
             s.websocket_created(data, stream, sink).await
         })
     }
