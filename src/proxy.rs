@@ -344,7 +344,7 @@ impl ProxyServer {
         if let Some(d) = self.distribution.get(distribution_id) {
             for conn in d.value() {
                 conn.client_sender.clone()
-                    .send(RawMessage::text_message(self.move_end_message.clone().into_bytes()))
+                    .send(Message::text(self.move_end_message.clone()))
                     .await.err().map(|e| error!("Couldn't send 'WSPROXY_MOVE_END' message because of: {:?}", e));
             }
         }
