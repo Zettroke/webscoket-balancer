@@ -2,22 +2,16 @@ use tokio::sync::RwLock;
 use std::sync::Arc;
 use crate::websocket::WebsocketData;
 use tokio::net::TcpStream;
-use bytes::{BufMut, Buf};
-use tokio::io::{AsyncWriteExt, AsyncRead, AsyncWrite};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering, AtomicBool};
 use tokio::sync::broadcast;
-use futures::task::{Context, Poll};
-use tokio::macros::support::Pin;
-use std::mem::MaybeUninit;
 use crate::websocket_util::HandshakeError;
 use tokio_tls::TlsStream;
 use dashmap::mapref::one::Ref;
-use tokio::time::{timeout_at, Instant, Duration};
 use http::Uri;
 use std::str::FromStr;
+use http::uri::Authority;
 
 #[derive(Debug, Builder)]
 pub struct ProxyLocation {
@@ -52,51 +46,15 @@ impl ProxyLocation {
         ProxyLocationBuilder::default()
     }
 
-    // async fn send_handshake<T: AsyncWrite + Unpin>(&self, socket: &mut T, data: &WebsocketData) -> Result<(), HandshakeError> {
-    //     let mut body = bytes::BytesMut::new();
-    //     body.put_slice(b"GET ");
-    //
-    //     body.put_slice(data.path.as_bytes());
-    //     if data.query_params.len() > 0 {
-    //         body.put_u8(b'?');
-    //         for (ind, (k, v)) in data.query_params.iter().enumerate() {
-    //             body.put_slice(k.as_bytes());
-    //             body.put_u8(b'=');
-    //             body.put_slice(v.as_bytes());
-    //             if ind != data.query_params.len() - 1 {
-    //                 body.put_u8(b'&');
-    //             }
-    //         }
-    //     }
-    //     body.put_slice(b" HTTP/1.1\r\n");
-    //
-    //     for (k, v) in data.headers.iter() {
-    //         if k == "host" {
-    //             body.put_slice(b"host: ");
-    //             body.put_slice(self.domain.as_ref().unwrap_or(&self.address).as_bytes());
-    //             body.put_slice(b"\r\n");
-    //         } else if k != "sec-websocket-extensions" {
-    //             body.put_slice(k.as_bytes());
-    //             body.put_slice(b": ");
-    //             body.put_slice(v.as_bytes());
-    //             body.put_slice(b"\r\n");
-    //         }
-    //     }
-    //     body.put_slice(b"\r\n");
-    //     socket.write_all(body.as_ref()).await?;
-    //     Ok(())
-    // }
-
-    pub async fn get_plain_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TcpStream, HandshakeError> {
+    pub async fn get_plain_connection(self: &ProxyLocation, _data: &WebsocketData) -> Result<TcpStream, HandshakeError> {
         let socket = TcpStream::connect(self.uri.authority().map(|a| a.as_str()).unwrap_or("")).await?;
 
-        // self.connect(socket, data).await
         self.connection_count.fetch_add(1, Ordering::Release);
 
         Ok(socket)
     }
 
-    pub async fn get_secure_connection(self: &ProxyLocation, data: &WebsocketData) -> Result<TlsStream<TcpStream>, HandshakeError> {
+    pub async fn get_secure_connection(self: &ProxyLocation, _data: &WebsocketData) -> Result<TlsStream<TcpStream>, HandshakeError> {
         let socket = TcpStream::connect(self.uri.authority().unwrap().as_str()).await?;
         let cx = native_tls::TlsConnector::builder().build()?;
         let cx = tokio_tls::TlsConnector::from(cx);
@@ -105,15 +63,6 @@ impl ProxyLocation {
         self.connection_count.fetch_add(1, Ordering::Release);
         Ok(tls_socket)
     }
-
-    // async fn connect<T: AsyncRead + AsyncWrite + Unpin>(self:&ProxyLocation, mut socket: T, data: &WebsocketData) -> Result<T, HandshakeError> {
-    //     self.send_handshake(&mut socket, data).await?;
-    //
-    //     let _v = crate::websocket_util::read_headers(&mut socket).await?;
-    //
-    //     self.connection_count.fetch_add(1, Ordering::Release);
-    //     Ok(socket)
-    // }
 }
 
 #[derive(Clone)]
@@ -178,6 +127,13 @@ impl LocationManager {
             loc.id = rand::random();
             if !loc_list.iter().any(|v| v.id == loc.id) { break; }
         }
+        if loc.uri.port().is_none() && loc.uri.scheme_str() == Some("wss") {
+            let mut parts = loc.uri.clone().into_parts();
+            let auth = parts.authority.as_ref().unwrap().as_str().to_string() + ":443";
+            parts.authority.replace(Authority::from_maybe_shared(auth).unwrap());
+            loc.uri = Uri::from_parts(parts).unwrap();
+        }
+        println!("{}", loc.uri.to_string());
         loc_list.push(Arc::new(loc));
     }
 

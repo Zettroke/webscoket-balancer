@@ -1,11 +1,4 @@
-use crate::websocket::{MAX_MESSAGE_SIZE, WebsocketData};
-use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncWrite, AsyncRead};
-use bytes::{BufMut, Buf};
 use thiserror::Error;
-use crate::message::{RawMessage, MessageOpCode};
-use futures::io::ErrorKind;
-extern crate memchr;
-use memchr::memchr;
 
 #[derive(Error, Debug)]
 pub enum MessageError{

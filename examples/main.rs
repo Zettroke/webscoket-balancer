@@ -5,7 +5,6 @@ use std::sync::Arc;
 use tokio::io::{BufReader, AsyncBufReadExt};
 use websocket_balancer::location_manager::{LocationManager, ProxyLocation};
 use std::sync::atomic::Ordering;
-use http::uri::Uri;
 use std::convert::TryInto;
 
 // #[macro_use] extern crate log;
@@ -15,8 +14,8 @@ async fn main() {
     env_logger::init();
     let lm = Arc::new(LocationManager::new());
     // let uri: Uri = "wss://127.0.0.1:13338".try_into().unwrap();
-    lm.add_location(ProxyLocation::new().uri("wss://127.0.0.1:13338".try_into().unwrap()).secure(false).build().unwrap()).await;
-    lm.add_location(ProxyLocation::new().uri("wss://127.0.0.1:13339".try_into().unwrap()).secure(false).build().unwrap()).await;
+    lm.add_location(ProxyLocation::new().uri("ws://127.0.0.1:1338".try_into().unwrap()).secure(false).build().unwrap()).await;
+    lm.add_location(ProxyLocation::new().uri("ws://127.0.0.1:1339".try_into().unwrap()).secure(false).build().unwrap()).await;
     // lm.add_location().await;
     // lm.add_location("127.0.0.1:13339".to_string()).await;
     let lmm = lm.clone();
